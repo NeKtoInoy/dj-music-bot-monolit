@@ -15,7 +15,15 @@ YTDL_OPTS = {
     'noplaylist': True,
     'quiet': True,
     'default_search': 'auto',
-    'source_address': '0.0.0.0'
+    'source_address': '0.0.0.0',
+    'extractor_retries': 3,
+    'socket_timeout': 10,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['mweb', 'web'],
+            'skip': ['dash', 'hls']
+        }
+    }
 }
 
 ffmpeg_opts = {
