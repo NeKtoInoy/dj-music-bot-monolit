@@ -44,7 +44,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 intents = discord.Intents.default()
 intents.message_content = True
 
-# Создаём бота с префиксом (он всё ещё нужен для discord.py, но команды будут через /)
+# Создаём бота
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
@@ -86,7 +86,7 @@ async def leave(interaction: discord.Interaction):
 
 @bot.tree.command(name="play", description="Воспроизвести аудио по ссылке или названию")
 async def play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()  # Чтобы Discord не ругался на долгий ответ
+    await interaction.response.defer()
 
     if not interaction.guild.voice_client:
         if interaction.user.voice:
@@ -115,13 +115,12 @@ async def stop(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("🔇 Ничего не играет.")
 
-# Запуск
-
-        if __name__ == "__main__":
+# Запуск бота — БЕЗ ЛИШНИХ ОТСТУПОВ!
+if __name__ == "__main__":
     try:
         bot.run(os.getenv('DISCORD_TOKEN'))
     except KeyboardInterrupt:
         print("[INFO] Бот остановлен вручную.")
     except Exception as e:
         print(f"[CRITICAL] Критическая ошибка: {e}")
-        raise  # чтобы увидеть полный traceback в логах Railway
+        raise
