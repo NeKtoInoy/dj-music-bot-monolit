@@ -3,6 +3,7 @@ from discord.ext import commands
 import yt_dlp
 import shutil
 import asyncio
+import random
 import os
 from dotenv import load_dotenv
 
@@ -46,7 +47,6 @@ intents.message_content = True
 
 # Создаём бота
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 @bot.event
 async def on_ready():
     # Проверка ffmpeg
@@ -63,7 +63,6 @@ async def on_ready():
         print(f"[ERROR] Синхронизация: {e}")
 
 # Слэш-команды
-
 @bot.tree.command(name="join", description="Подключиться к вашему голосовому каналу")
 async def join(interaction: discord.Interaction):
     if interaction.user.voice:
@@ -76,6 +75,7 @@ async def join(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ Ты не в голосовом канале!")
 
+# Кнопка выхода из канала
 @bot.tree.command(name="leave", description="Отключиться от голосового канала")
 async def leave(interaction: discord.Interaction):
     if interaction.guild.voice_client:
@@ -84,6 +84,7 @@ async def leave(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ Я не в голосовом канале.")
 
+# Кнопка играть музыку
 @bot.tree.command(name="play", description="Воспроизвести аудио по ссылке или названию")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
@@ -106,6 +107,7 @@ async def play(interaction: discord.Interaction, query: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Не удалось воспроизвести: {str(e)}")
 
+# Кнопка остановки музыки
 @bot.tree.command(name="stop", description="Остановить воспроизведение")
 async def stop(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -115,7 +117,34 @@ async def stop(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("🔇 Ничего не играет.")
 
-# Запуск бота — БЕЗ ЛИШНИХ ОТСТУПОВ!
+# Рандомные сталкерские цитаты
+@bot.tree.command(name="stalker", description="Получить мудрость из Зоны")
+async def stalker(interaction: discord.Interaction):
+    quotes = [
+        "Зона не прощает ошибок. Только — шансов.",
+        "Снова слышу звон... Кажется, 'Грави' где-то рядом.",
+        "Не верь Клыку — он с Монолитом.",
+        "В Зоне выживает не сильнейший, а тот, кто не лезет без нужды.",
+        "Артефакт — не цель. Выживание — цель.",
+        "Тишина в Зоне страшнее выстрелов.",
+        "Если видишь аномалию — бросай болт. Если не видишь — бросай два.",
+        "Монолит зовёт... но я не пойду.",
+        "Карта — ложь. Глаза — правда.",
+        "Смерть в Зоне приходит тихо. И всегда — сзади."
+    ]
+    quote = random.choice(quotes)
+    await interaction.response.send_message(f"📜 *{quote}*")
+
+# Простая очередь — пока только показывает текущий трек
+@bot.tree.command(name="queue", description="Показать очередь воспроизведения")
+async def queue(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
+        await interaction.response.send_message("🎵 Сейчас играет: *Неизвестный трек*\nОчередь: пусто (пока не реализована)")
+    else:
+        await interaction.response.send_message("🔇 Ничего не играет. Очередь пуста.")
+
+# Запуск бота
 if __name__ == "__main__":
     try:
         bot.run(os.getenv('DISCORD_TOKEN'))
