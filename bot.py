@@ -48,13 +48,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"[OK] Бот {bot.user} запущен и готов к музыке!")
-    # Синхронизируем слэш-команды с Discord
+    try:
+        print(f"[OK] Бот {bot.user} запущен и готов к музыке!")
+    except UnicodeEncodeError:
+        # Обход ошибки эмодзи/кодировки в некоторых средах
+        print(f"[OK] Bot {bot.user} is online and ready!")
+
     try:
         synced = await bot.tree.sync()
         print(f"[INFO] Синхронизировано {len(synced)} слэш-команд.")
     except Exception as e:
-        print(f"[ERROR] Не удалось синхронизировать команды: {e}")
+        print(f"[ERROR] Синхронизация команд не удалась: {e}")
 
 # Слэш-команды
 
