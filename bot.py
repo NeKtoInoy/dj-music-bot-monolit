@@ -18,7 +18,10 @@ from dotenv import load_dotenv
 load_dotenv()  # DISCORD_TOKEN берётся из .env
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
+if os.getenv("VOICE_DEBUG"):  # подробный лог голосового соединения: docker run -e VOICE_DEBUG=1 ...
+    for name in ("discord.voice_state", "discord.gateway", "discord.player"):
+        logging.getLogger(name).setLevel(logging.DEBUG)
 log = logging.getLogger("dj-bot")
 
 YTDL_OPTS = {
@@ -461,7 +464,7 @@ async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient 
         return None
     vc = interaction.guild.voice_client
     if vc is None:
-        return await voice.channel.connect(self_deaf=True)
+        return await voice.channel.connect()
     if vc.channel != voice.channel:
         if vc.is_playing() or vc.is_paused():
             await interaction.followup.send(f"❌ Я уже играю в {vc.channel.mention}.")
