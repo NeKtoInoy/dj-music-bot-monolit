@@ -39,6 +39,7 @@ def open_audio(url: str) -> tuple[subprocess.Popen, discord.FFmpegPCMAudio]:
     Прямую ссылку ffmpeg YouTube теперь часто режет ошибкой 403."""
     proc = subprocess.Popen(
         [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
+         "--downloader", "native", "--http-chunk-size", "10M",
          "-f", "bestaudio/best", "-o", "-", url],
         stdout=subprocess.PIPE,
     )
