@@ -14,5 +14,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY bot.py .
 
+# nice -10: звуку процессор в первую очередь (нужен --cap-add SYS_NICE, без него просто запустится как обычно)
 # -u: логи сразу в docker logs
-CMD ["python", "-u", "bot.py"]
+CMD ["nice", "-n", "-10", "python", "-u", "bot.py"]
