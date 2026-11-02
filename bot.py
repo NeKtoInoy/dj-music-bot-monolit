@@ -808,7 +808,15 @@ async def play(interaction: discord.Interaction, query: str):
             else:
                 await interaction.followup.send(f"➕ В очереди #{len(p.queue)}: {track.label()}{found}")
     except Exception as e:
-        return await interaction.followup.send(f"❌ Не нашёл: {e}")
+        log.warning("/play %r: %s", query, e)
+        if re.search(r"vk\.com|vk\.ru|^audio-?\d+_", query):
+            msg = "❌ Музыку из ВК достать не могу — она доступна только с аккаунта. Напиши название трека, найду на YouTube."
+        elif "://" in query or re.match(r"^\S+\.[a-z]{2,}/\S*$", query):
+            msg = ("❌ Не получилось открыть ссылку. Понимаю YouTube, SoundCloud, а также треки из Spotify и Яндекс Музыки. "
+                   "Можно просто написать название.")
+        else:
+            msg = f"❌ Не нашёл: {str(e).removeprefix('ERROR: ')[:200]}"
+        return await interaction.followup.send(msg)
 
     if p.current:
         await p.refresh_panel()
