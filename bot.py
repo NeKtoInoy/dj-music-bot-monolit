@@ -2,8 +2,9 @@
 import logging
 import os
 import random
-import shlex
 import shutil
+import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -33,16 +34,16 @@ YTDL_OPTS = {
 # для плейлистов: только список треков, без загрузки каждого
 YTDL_FLAT_OPTS = {**YTDL_OPTS, "noplaylist": False, "extract_flat": "in_playlist"}
 
-FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
-
-
-def ffmpeg_opts(data: dict) -> dict:
-    """ffmpeg должен ходить за звуком с теми же заголовками, что и yt-dlp, иначе YouTube отвечает 403."""
-    before = FFMPEG_BEFORE
-    headers = data.get("http_headers") or {}
-    if headers:
-        before += " -headers " + shlex.quote("".join(f"{k}: {v}\r\n" for k, v in headers.items()))
-    return {"before_options": before, "options": "-vn"}
+def open_audio(url: str) -> tuple[subprocess.Popen, discord.FFmpegPCMAudio]:
+    """yt-dlp качает звук кусками и отдаёт его ffmpeg через трубу.
+    Прямую ссылку ffmpeg YouTube теперь часто режет ошибкой 403."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
+         "-f", "bestaudio/best", "-o", "-", url],
+        stdout=subprocess.PIPE,
+    )
+    audio = discord.FFmpegPCMAudio(proc.stdout, pipe=True, before_options="-nostdin", options="-vn")
+    return proc, audio
 
 ALONE_TIMEOUT = 60      # сек: выйти, если в канале никого не осталось
 PANEL_REFRESH = 15      # сек: как часто обновлять панель (чаще — упрёмся в лимиты Discord)
@@ -236,13 +237,8 @@ class GuildPlayer:
             track = self.queue.popleft()
             self.current = track
             try:
-                # ссылка на поток живёт недолго, поэтому берём её прямо перед игрой
-                data = await extract(track.page_url)
-                track.thumbnail = data.get("thumbnail") or track.thumbnail
-                track.duration = data.get("duration") or track.duration
-                source = discord.PCMVolumeTransformer(
-                    discord.FFmpegPCMAudio(data["url"], **ffmpeg_opts(data)), volume=self.volume
-                )
+                proc, audio = open_audio(track.page_url)
+                source = discord.PCMVolumeTransformer(audio, volume=self.volume)
             except Exception as e:
                 log.warning("Не загрузился %s: %s", track.title, e)
                 await self.send(f"❌ Не смог загрузить {track.label()}: {e}")
@@ -262,9 +258,13 @@ class GuildPlayer:
             vc.play(source, after=after)
             await self.show_panel()
             await done.wait()
+            rc = proc.poll()  # код выхода yt-dlp (None — ещё работает, например при пропуске)
+            if rc is None:
+                proc.kill()
+            await asyncio.get_running_loop().run_in_executor(None, proc.wait)
 
-            # трек «закончился» почти сразу и его никто не пропускал — значит ffmpeg не смог открыть поток
-            if self.elapsed() < 3 and not self.skip_requested and not self.stop_requested:
+            # yt-dlp упал, а трек никто не пропускал — значит YouTube не отдал звук
+            if rc not in (None, 0) and not self.skip_requested and not self.stop_requested:
                 await self.send(f"❌ YouTube не отдал звук для {track.label()} (подробности в консоли бота).")
                 continue
 
@@ -505,6 +505,7 @@ async def play(interaction: discord.Interaction, query: str):
                     page_url=e.get("url") or f"https://www.youtube.com/watch?v={e.get('id')}",
                     duration=e.get("duration"),
                     requester=requester,
+                    thumbnail=(e.get("thumbnails") or [{}])[-1].get("url"),
                 )
                 for e in entries
             ]
