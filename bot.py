@@ -2,6 +2,7 @@
 import logging
 import os
 import random
+import shlex
 import shutil
 import time
 from collections import deque
@@ -32,10 +33,16 @@ YTDL_OPTS = {
 # для плейлистов: только список треков, без загрузки каждого
 YTDL_FLAT_OPTS = {**YTDL_OPTS, "noplaylist": False, "extract_flat": "in_playlist"}
 
-FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin",
-    "options": "-vn",
-}
+FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+
+
+def ffmpeg_opts(data: dict) -> dict:
+    """ffmpeg должен ходить за звуком с теми же заголовками, что и yt-dlp, иначе YouTube отвечает 403."""
+    before = FFMPEG_BEFORE
+    headers = data.get("http_headers") or {}
+    if headers:
+        before += " -headers " + shlex.quote("".join(f"{k}: {v}\r\n" for k, v in headers.items()))
+    return {"before_options": before, "options": "-vn"}
 
 ALONE_TIMEOUT = 60      # сек: выйти, если в канале никого не осталось
 PANEL_REFRESH = 15      # сек: как часто обновлять панель (чаще — упрёмся в лимиты Discord)
@@ -234,7 +241,7 @@ class GuildPlayer:
                 track.thumbnail = data.get("thumbnail") or track.thumbnail
                 track.duration = data.get("duration") or track.duration
                 source = discord.PCMVolumeTransformer(
-                    discord.FFmpegPCMAudio(data["url"], **FFMPEG_OPTS), volume=self.volume
+                    discord.FFmpegPCMAudio(data["url"], **ffmpeg_opts(data)), volume=self.volume
                 )
             except Exception as e:
                 log.warning("Не загрузился %s: %s", track.title, e)
@@ -255,6 +262,11 @@ class GuildPlayer:
             vc.play(source, after=after)
             await self.show_panel()
             await done.wait()
+
+            # трек «закончился» почти сразу и его никто не пропускал — значит ffmpeg не смог открыть поток
+            if self.elapsed() < 3 and not self.skip_requested and not self.stop_requested:
+                await self.send(f"❌ YouTube не отдал звук для {track.label()} (подробности в консоли бота).")
+                continue
 
             if self.stop_requested:
                 self.stop_requested = False
