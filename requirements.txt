@@ -1,3 +1,5 @@
 discord.py[voice]
+# davey 0.2 сломал совместимость с discord.py 2.7.1 (ключи DAVE не включаются → тишина)
+davey<0.2
 yt-dlp[default]
 python-dotenv
