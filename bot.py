@@ -43,6 +43,7 @@ INFO_TTL = 30 * 60               # сек: сколько живёт сохра�
 PANEL_COLOR = 0x1D9E75
 OPUS_BITRATE = 128              # кбит/с: ffmpeg сразу отдаёт сжатый звук, боту не надо его кодировать
 STATE_PATH = os.getenv("STATE_PATH", os.path.expanduser("~/.cache/dj-bot/state.json"))
+CONFIG_PATH = os.path.join(os.path.dirname(STATE_PATH), "config.json")  # какой канал на каком сервере — музыкальный
 STATE_SAVE_EVERY = 10           # сек: как часто сохранять очередь (чтобы пережить перезапуск)
 
 # эффекты: название → (фильтр ffmpeg, во сколько раз меняется скорость)
@@ -302,6 +303,8 @@ class GuildPlayer:
         self.history: deque[Track] = deque(maxlen=HISTORY_SIZE)
         self.current: Track | None = None
         self.last_played: Track | None = None   # от него отталкивается автоплей
+        self.last_action: str | None = None     # «Утрырыш добавил …» — строка внизу плеера
+        self.restart_timer: asyncio.Task | None = None
         self.volume = 0.5
         self.loop_mode = "off"
         self.autoplay = False
@@ -371,11 +374,24 @@ class GuildPlayer:
                 "volume": self.volume, "loop": self.loop_mode, "autoplay": self.autoplay, "effect": self.effect}
 
     async def send(self, text: str):
-        if self.text_channel:
+        """Сообщение в чат. В музыкальном канале — исчезает через 15 сек, чтобы не мусорить."""
+        home = self.home_channel_id
+        channel = self.guild.get_channel(home) if home else self.text_channel
+        if channel:
             try:
-                await self.text_channel.send(text)
+                await channel.send(text, delete_after=15 if home else None)
             except discord.HTTPException:
                 pass
+
+    def schedule_restart(self, delay: float = 1.2):
+        """Перезапуск трека с задержкой — чтобы пять нажатий «громче» подряд дали один перезапуск."""
+        if self.restart_timer and not self.restart_timer.done():
+            self.restart_timer.cancel()
+
+        async def later():
+            await asyncio.sleep(delay)
+            self.restart_at()
+        self.restart_timer = asyncio.create_task(later())
 
     # ---------- управление ----------
 
@@ -609,55 +625,106 @@ class GuildPlayer:
 
     # ---------- панель ----------
 
+    @property
+    def home_channel_id(self) -> int | None:
+        """Музыкальный канал этого сервера (задаётся /setup)."""
+        return self.bot.config.get(str(self.guild.id), {}).get("channel")
+
+    def is_home(self, channel_id) -> bool:
+        return channel_id is not None and channel_id == self.home_channel_id
+
     def build_embed(self) -> discord.Embed:
         t = self.current
-        e = discord.Embed(title=t.title[:256], url=t.page_url, color=PANEL_COLOR)
-        e.set_author(name="⏸️ Пауза" if self.is_paused else "▶️ Сейчас играет")
-        el = self.elapsed()
-        e.description = f"`{fmt_time(el)}` {progress_bar(el, t.duration)} `{fmt_time(t.duration)}`"
-        if t.thumbnail:
-            e.set_thumbnail(url=t.thumbnail)
-        upcoming = list(self.queue)[:3]
-        value = "\n".join(f"`{i}.` {x.title[:60]}" for i, x in enumerate(upcoming, 1))
-        if not value:
-            value = "📻 подберу похожее" if self.autoplay else "пусто"
-        if len(self.queue) > 3:
-            value += f"\n…и ещё {len(self.queue) - 3}"
-        e.add_field(name="Далее", value=value, inline=False)
-        e.set_footer(
-            text=f"Заказал {t.requester} · громкость {round(self.volume * 100)}% · "
-                 f"повтор: {LOOP_LABEL[self.loop_mode]} · автоплей: {'вкл' if self.autoplay else 'выкл'}"
-                 + (f" · эффект: {EFFECT_LABEL[self.effect]}" if self.effect != "none" else "")
-        )
+        if t:
+            e = discord.Embed(title=t.title[:256], url=t.page_url, color=PANEL_COLOR)
+            e.set_author(name=f"☢ Радио «Монолит» · {'пауза' if self.is_paused else 'сейчас играет'}")
+            el = self.elapsed()
+            e.description = f"`{fmt_time(el)}` {progress_bar(el, t.duration)} `{fmt_time(t.duration)}`"
+            if t.thumbnail:
+                e.set_thumbnail(url=t.thumbnail)
+        else:
+            e = discord.Embed(title="Тишина в эфире", color=PANEL_COLOR)
+            e.set_author(name="☢ Радио «Монолит»")
+            e.description = ("Нажми **➕ Добавить** или просто напиши название трека в этот канал."
+                             if self.home_channel_id else "`/play`, чтобы включить музыку.")
+        q = list(self.queue)
+        if t or q:
+            lines = [f"`{i}.` {x.title[:55]}" + (" 📻" if x.requester == AUTOPLAY_REQUESTER else "")
+                     for i, x in enumerate(q[:8], 1)]
+            if len(q) > 8:
+                lines.append(f"…и ещё {len(q) - 8}")
+            if not lines:
+                lines = ["📻 подберу похожее" if self.autoplay else "пусто"]
+            e.add_field(name=f"Очередь · {len(q)}", value="\n".join(lines)[:1024], inline=False)
+        if self.history:
+            recent = list(self.history)[::-1][:5]
+            e.add_field(name="Недавно играло", value="\n".join(f"· {x.title[:60]}" for x in recent)[:1024], inline=False)
+        info = [f"громкость {round(self.volume * 100)}%", f"повтор: {LOOP_LABEL[self.loop_mode]}",
+                f"автоплей: {'вкл' if self.autoplay else 'выкл'}"]
+        if self.effect != "none":
+            info.append(f"эффект: {EFFECT_LABEL[self.effect]}")
+        if t:
+            info.insert(0, f"заказал {t.requester}")
+        text = " · ".join(info)
+        if self.last_action:
+            text = f"{self.last_action}\n{text}"
+        e.set_footer(text=text[:2048])
         return e
 
-    async def show_panel(self):
-        """Новая панель под каждый трек — чтобы она всегда была внизу чата."""
-        if not self.text_channel:
-            return
-        if self.panel:
+    async def _home_message(self) -> discord.Message | None:
+        """Сообщение-плеер в музыкальном канале. Если его удалили — создаёт заново."""
+        cfg = self.bot.config.get(str(self.guild.id))
+        channel = self.guild.get_channel(cfg["channel"]) if cfg else None
+        if channel is None:
+            return None
+        if self.panel and self.panel.id == cfg.get("message"):
+            return self.panel
+        msg = None
+        if cfg.get("message"):
             try:
-                await self.panel.delete()
+                msg = await channel.fetch_message(cfg["message"])
+            except discord.HTTPException:
+                msg = None
+        if msg is None:
+            msg = await channel.send(embed=self.build_embed(), view=PlayerView(self))
+            cfg["message"] = msg.id
+            self.bot.save_config()
+            try:
+                await msg.pin()
             except discord.HTTPException:
                 pass
-        self.view = PlayerView(self)
-        try:
-            self.panel = await self.text_channel.send(embed=self.build_embed(), view=self.view)
-        except discord.HTTPException:
-            self.panel = None
+        self.panel = msg
+        return msg
+
+    async def show_panel(self):
+        if self.home_channel_id:
+            await self.refresh_panel()
+        elif self.text_channel:
+            # без музыкального канала — как раньше: новая панель под каждый трек, чтобы была внизу чата
+            if self.panel:
+                try:
+                    await self.panel.delete()
+                except discord.HTTPException:
+                    pass
+            try:
+                self.panel = await self.text_channel.send(embed=self.build_embed(), view=PlayerView(self))
+            except discord.HTTPException:
+                self.panel = None
         if self.updater is None or self.updater.done():
             self.updater = asyncio.create_task(self._update_panel())
 
     async def refresh_panel(self):
-        if not (self.panel and self.current and self.view):
-            return
-        self.view.sync()
         try:
-            await self.panel.edit(embed=self.build_embed(), view=self.view)
+            if self.home_channel_id:
+                msg = await self._home_message()
+                if msg:
+                    await msg.edit(embed=self.build_embed(), view=PlayerView(self))
+            elif self.panel and self.current:
+                await self.panel.edit(embed=self.build_embed(), view=PlayerView(self))
         except discord.NotFound:
             self.panel = None
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            log.warning("Не смог обновить панель: %s", e)
 
     async def _update_panel(self):
         while self.current:
@@ -665,6 +732,9 @@ class GuildPlayer:
             await self.refresh_panel()
 
     async def finish_panel(self):
+        if self.home_channel_id:
+            await self.refresh_panel()  # плеер остаётся, просто показывает «тишину в эфире»
+            return
         if self.panel:
             try:
                 await self.panel.edit(
@@ -676,77 +746,223 @@ class GuildPlayer:
             self.panel = None
 
 
+def same_voice(interaction: discord.Interaction) -> str | None:
+    """Кнопками управляют только те, кто сидит с ботом в одном канале."""
+    vc = interaction.guild.voice_client
+    voice = interaction.user.voice
+    if not vc:
+        return "🔇 Я сейчас не в канале. Нажми **➕ Добавить**, чтобы включить музыку."
+    if not voice or voice.channel != vc.channel:
+        return "❌ Зайди в мой голосовой канал."
+    return None
+
+
 class PlayerView(discord.ui.View):
-    """Кнопки под панелью."""
+    """Кнопки и меню плеера. custom_id постоянные — кнопки работают и после перезапуска бота."""
 
-    def __init__(self, player: GuildPlayer):
+    def __init__(self, player: "GuildPlayer | None"):
         super().__init__(timeout=None)
-        self.player = player
-        self.sync()
+        self.add_item(QueueSelect(player))
+        self.add_item(EffectSelect(player))
+        if player:
+            self.pause_btn.emoji = "▶️" if player.is_paused else "⏸️"
+            self.loop_btn.emoji = "🔂" if player.loop_mode == "track" else "🔁"
+            self.loop_btn.style = (discord.ButtonStyle.secondary if player.loop_mode == "off"
+                                   else discord.ButtonStyle.success)
+            self.autoplay_btn.style = (discord.ButtonStyle.success if player.autoplay
+                                       else discord.ButtonStyle.secondary)
 
-    def sync(self):
-        p = self.player
-        self.pause_btn.emoji = "▶️" if p.is_paused else "⏸️"
-        self.loop_btn.emoji = "🔂" if p.loop_mode == "track" else "🔁"
-        self.loop_btn.style = discord.ButtonStyle.secondary if p.loop_mode == "off" else discord.ButtonStyle.success
-        self.autoplay_btn.style = discord.ButtonStyle.success if p.autoplay else discord.ButtonStyle.secondary
+    @staticmethod
+    async def guard(interaction: discord.Interaction) -> GuildPlayer | None:
+        err = same_voice(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return None
+        return bot.player(interaction.guild)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        vc = self.player.vc
-        voice = interaction.user.voice
-        if not vc or not voice or voice.channel != vc.channel:
-            await interaction.response.send_message("❌ Зайди в мой голосовой канал.", ephemeral=True)
-            return False
-        return True
+    @staticmethod
+    async def redraw(interaction: discord.Interaction, p: GuildPlayer):
+        await interaction.response.edit_message(embed=p.build_embed(), view=PlayerView(p))
 
-    async def redraw(self, interaction: discord.Interaction):
-        self.sync()
-        if self.player.current:
-            await interaction.response.edit_message(embed=self.player.build_embed(), view=self)
-        else:
-            await interaction.response.defer()
-
-    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0, custom_id="dj:prev")
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.player.previous():
-            await interaction.response.defer()  # новая панель появится сама
+        if not (p := await self.guard(interaction)):
+            return
+        if p.previous():
+            p.last_action = f"⏮️ {interaction.user.display_name} вернул прошлый трек"
+            await interaction.response.defer()
         else:
             await interaction.response.send_message("📭 История пуста.", ephemeral=True)
 
-    @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary, row=0, custom_id="dj:pause")
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player.resume():
-            self.player.pause()
-        await self.redraw(interaction)
+        if not (p := await self.guard(interaction)):
+            return
+        if p.resume():
+            p.last_action = f"▶️ {interaction.user.display_name} снял с паузы"
+        elif p.pause():
+            p.last_action = f"⏸️ {interaction.user.display_name} поставил на паузу"
+        await self.redraw(interaction, p)
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0, custom_id="dj:skip")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.player.skip()
+        if not (p := await self.guard(interaction)):
+            return
+        if p.current and p.skip():
+            p.last_action = f"⏭️ {interaction.user.display_name} пропустил «{p.current.title[:40]}»"
         await interaction.response.defer()
 
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0, custom_id="dj:stop")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.player.stop()
+        if not (p := await self.guard(interaction)):
+            return
+        p.stop()
+        p.last_action = f"⏹️ {interaction.user.display_name} остановил музыку"
         await interaction.response.defer()
 
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Добавить", emoji="➕", style=discord.ButtonStyle.success, row=0, custom_id="dj:add")
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddModal())
+
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1, custom_id="dj:voldown")
+    async def voldown_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_volume(interaction, -0.1)
+
+    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1, custom_id="dj:volup")
+    async def volup_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_volume(interaction, +0.1)
+
+    async def change_volume(self, interaction: discord.Interaction, delta: float):
+        if not (p := await self.guard(interaction)):
+            return
+        p.volume = round(min(1.0, max(0.0, p.volume + delta)), 2)
+        p.last_action = f"🔊 {interaction.user.display_name}: громкость {round(p.volume * 100)}%"
+        p.schedule_restart()
+        await self.redraw(interaction, p)
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=1, custom_id="dj:loop")
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.player.loop_mode = LOOP_NEXT[self.player.loop_mode]
-        await self.redraw(interaction)
+        if not (p := await self.guard(interaction)):
+            return
+        p.loop_mode = LOOP_NEXT[p.loop_mode]
+        p.last_action = f"🔁 {interaction.user.display_name}: повтор — {LOOP_LABEL[p.loop_mode]}"
+        await self.redraw(interaction, p)
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=1, custom_id="dj:shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.player.shuffle()
-        await self.redraw(interaction)
+        if not (p := await self.guard(interaction)):
+            return
+        if p.shuffle():
+            p.last_action = f"🔀 {interaction.user.display_name} перемешал очередь"
+        await self.redraw(interaction, p)
 
-    @discord.ui.button(emoji="📻", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="📻", style=discord.ButtonStyle.secondary, row=1, custom_id="dj:autoplay")
     async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.player.autoplay = not self.player.autoplay
-        await self.redraw(interaction)
+        if not (p := await self.guard(interaction)):
+            return
+        p.autoplay = not p.autoplay
+        p.last_action = f"📻 {interaction.user.display_name}: автоплей {'включён' if p.autoplay else 'выключен'}"
+        await self.redraw(interaction, p)
 
-    @discord.ui.button(emoji="📜", style=discord.ButtonStyle.secondary, row=1)
-    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(queue_text(self.player), ephemeral=True)
+
+class QueueSelect(discord.ui.Select):
+    """Меню очереди: выбрал трек — дальше «играть сейчас / следующим / убрать»."""
+
+    def __init__(self, player: "GuildPlayer | None"):
+        q = list(player.queue)[:25] if player else []
+        options = [discord.SelectOption(label=f"{i}. {t.title}"[:100], value=str(i - 1),
+                                        description=f"заказал {t.requester}"[:100])
+                   for i, t in enumerate(q, 1)]
+        super().__init__(
+            custom_id="dj:queue", row=2,
+            placeholder="Очередь: перейти к треку или убрать…" if options else "Очередь пуста",
+            options=options or [discord.SelectOption(label="пусто", value="-1")],
+            disabled=bool(player) and not options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        p = bot.player(interaction.guild)
+        idx = int(self.values[0])
+        if not 0 <= idx < len(p.queue):
+            return await interaction.response.send_message("Этого трека уже нет в очереди.", ephemeral=True)
+        t = p.queue[idx]
+        await interaction.response.send_message(f"🎵 {t.label()} — заказал {t.requester}", view=QueueItemView(t), ephemeral=True)
+
+
+class QueueItemView(discord.ui.View):
+    def __init__(self, track: Track):
+        super().__init__(timeout=120)
+        self.track = track
+
+    async def take(self, interaction: discord.Interaction) -> GuildPlayer | None:
+        """Достаёт трек из очереди (если он там ещё есть)."""
+        err = same_voice(interaction)
+        if err:
+            await interaction.response.edit_message(content=err, view=None)
+            return None
+        p = bot.player(interaction.guild)
+        for i, t in enumerate(p.queue):
+            if t is self.track:
+                del p.queue[i]
+                return p
+        await interaction.response.edit_message(content="Этого трека уже нет в очереди.", view=None)
+        return None
+
+    @discord.ui.button(label="Играть сейчас", emoji="▶️", style=discord.ButtonStyle.success)
+    async def now_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (p := await self.take(interaction)):
+            return
+        p.queue.appendleft(self.track)
+        p.last_action = f"▶️ {interaction.user.display_name} включил «{self.track.title[:40]}»"
+        if not p.skip():
+            p.start()
+        await interaction.response.edit_message(content=f"▶️ Включаю {self.track.label()}", view=None)
+
+    @discord.ui.button(label="Следующим", emoji="⬆️", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (p := await self.take(interaction)):
+            return
+        p.queue.appendleft(self.track)
+        p.last_action = f"⬆️ {interaction.user.display_name} поднял «{self.track.title[:40]}»"
+        await interaction.response.edit_message(content=f"⬆️ {self.track.label()} будет следующим", view=None)
+        await p.refresh_panel()
+
+    @discord.ui.button(label="Убрать", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (p := await self.take(interaction)):
+            return
+        self.track.drop_info()
+        p.last_action = f"🗑️ {interaction.user.display_name} убрал «{self.track.title[:40]}»"
+        await interaction.response.edit_message(content=f"🗑️ Убрал {self.track.label()}", view=None)
+        await p.refresh_panel()
+
+
+class EffectSelect(discord.ui.Select):
+    def __init__(self, player: "GuildPlayer | None"):
+        current = player.effect if player else "none"
+        super().__init__(
+            custom_id="dj:effect", row=3, placeholder="Эффект",
+            options=[discord.SelectOption(label=f"Эффект: {label}", value=key, default=key == current)
+                     for key, label in EFFECT_LABEL.items()],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not (p := await PlayerView.guard(interaction)):
+            return
+        pos = p.elapsed() if p.current else 0.0
+        p.effect = self.values[0]
+        p.restart_at(pos)
+        p.last_action = f"🎛️ {interaction.user.display_name}: эффект — {EFFECT_LABEL[p.effect]}"
+        await PlayerView.redraw(interaction, p)
+
+
+class AddModal(discord.ui.Modal, title="Добавить трек"):
+    query = discord.ui.TextInput(label="Название или ссылка", placeholder="Кино — Группа крови", max_length=300)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await add_from(interaction.guild, interaction.user, str(self.query.value), interaction.channel)
+        await interaction.followup.send(result, ephemeral=True)
 
 
 # ---------- бот ----------
@@ -759,6 +975,21 @@ class DJBot(commands.Bot):
         self.players: dict[int, GuildPlayer] = {}
         self._restored = False
         self._last_state = ""
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                self.config: dict = json.load(f)
+        except Exception:
+            self.config = {}
+
+    def save_config(self):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.config, f)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception as e:
+            log.warning("Не смог сохранить настройки: %s", e)
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -774,6 +1005,7 @@ class DJBot(commands.Bot):
             pass
 
     async def setup_hook(self):
+        self.add_view(PlayerView(None))  # кнопки старых плееров работают и после перезапуска
         synced = await self.tree.sync()
         log.info("Синхронизировано слэш-команд: %d", len(synced))
         if os.path.exists("/.dockerenv"):  # в Docker перезапуск после обновления сделает сам Docker
@@ -873,14 +1105,18 @@ class DJBot(commands.Bot):
         if not self._restored:
             self._restored = True
             await self.restore_state()
+            for gid in list(self.config):  # привести плееры в музыкальных каналах в актуальный вид
+                guild = self.get_guild(int(gid))
+                if guild:
+                    await self.player(guild).refresh_panel()
 
     async def on_voice_state_update(self, member, before, after):
         guild = member.guild
         # бота выкинули из канала — гасим очередь и фоновые задачи
         if member.id == self.user.id and after.channel is None:
-            p = self.players.pop(guild.id, None)
+            p = self.players.get(guild.id)
             if p:
-                p.cleanup()
+                p.cleanup()  # сам плеер оставляем: в нём история и настройки
             return
         vc = guild.voice_client
         if vc is None:
@@ -897,55 +1133,45 @@ class DJBot(commands.Bot):
 bot = DJBot()
 
 
-async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
-    """Подключает бота к каналу пользователя. Требует уже сделанного defer()."""
-    voice = interaction.user.voice
+# ---------- общая логика добавления треков ----------
+
+async def connect_member(member: discord.Member) -> tuple[discord.VoiceClient | None, str | None]:
+    """Подключает бота к каналу участника. Возвращает (голос, ошибка)."""
+    voice = member.voice
     if not voice or not voice.channel:
-        await interaction.followup.send("❌ Сначала зайди в голосовой канал.")
-        return None
-    vc = interaction.guild.voice_client
+        return None, "❌ Сначала зайди в голосовой канал."
+    vc = member.guild.voice_client
     if vc is None:
-        return await voice.channel.connect()
+        return await voice.channel.connect(), None
     if vc.channel != voice.channel:
         if vc.is_playing() or vc.is_paused():
-            await interaction.followup.send(f"❌ Я уже играю в {vc.channel.mention}.")
-            return None
+            return None, f"❌ Я уже играю в {vc.channel.mention}."
         await vc.move_to(voice.channel)
-    return vc
+    return vc, None
 
 
-# ---------- команды ----------
-
-@bot.tree.command(name="join", description="Подключиться к вашему голосовому каналу")
-@app_commands.guild_only()
-async def join(interaction: discord.Interaction):
-    await interaction.response.defer()
-    vc = await ensure_voice(interaction)
-    if vc:
-        bot.player(interaction.guild).start()  # запустит таймер простоя, если играть нечего
-        await interaction.followup.send(f"✅ Я в {vc.channel.mention}")
+def friendly_error(query: str, e: Exception) -> str:
+    log.warning("Не смог добавить %r: %s", query, e)
+    if re.search(r"vk\.com|vk\.ru|^audio-?\d+_", query):
+        return "❌ Музыку из ВК достать не могу — она доступна только с аккаунта. Напиши название трека, найду на YouTube."
+    if "://" in query or re.match(r"^\S+\.[a-z]{2,}/\S*$", query):
+        return ("❌ Не получилось открыть ссылку. Понимаю YouTube, SoundCloud, а также треки из Spotify и Яндекс Музыки. "
+                "Можно просто написать название.")
+    return f"❌ Не нашёл: {str(e).removeprefix('ERROR: ')[:200]}"
 
 
-@bot.tree.command(name="leave", description="Отключиться от голосового канала")
-@app_commands.guild_only()
-async def leave(interaction: discord.Interaction):
-    if not interaction.guild.voice_client:
-        return await interaction.response.send_message("❌ Я не в голосовом канале.")
-    await bot.player(interaction.guild).disconnect()
-    await interaction.response.send_message("👋 Покинул канал.")
-
-
-@bot.tree.command(name="play", description="Трек или плейлист: ссылка (YouTube, Spotify, Яндекс Музыка) или название")
-@app_commands.describe(query="Начни вводить название — появятся подсказки. Или вставь ссылку")
-@app_commands.guild_only()
-async def play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    vc = await ensure_voice(interaction)
-    if not vc:
-        return
-    p = bot.player(interaction.guild)
-    p.text_channel = interaction.channel
-    requester = interaction.user.display_name
+async def add_from(guild: discord.Guild, member: discord.Member, query: str, channel) -> str:
+    """Добавляет трек/плейлист по запросу. Общая для /play, кнопки «➕» и сообщений в музыкальном канале."""
+    query = query.strip()
+    if not query:
+        return "❌ Пустой запрос."
+    vc, err = await connect_member(member)
+    if err:
+        return err
+    p = bot.player(guild)
+    if channel is not None:
+        p.text_channel = channel
+    who = member.display_name
 
     try:
         external = await resolve_external(query)
@@ -953,18 +1179,19 @@ async def play(interaction: discord.Interaction, query: str):
             query = external
         if is_playlist(query):
             title, entries = await extract_playlist(query)
-            tracks = [track_from_flat(e, requester) for e in entries]
+            tracks = [track_from_flat(e, who) for e in entries]
             if not tracks:
-                return await interaction.followup.send("❌ Плейлист пустой или закрытый.")
+                return "❌ Плейлист пустой или закрытый."
             p.queue.extend(tracks)
-            await interaction.followup.send(f"📃 Плейлист **{title}**: добавил {len(tracks)} треков")
+            p.last_action = f"📃 {who} добавил плейлист «{title[:40]}» ({len(tracks)})"
+            result = f"📃 Плейлист **{title}**: добавил {len(tracks)} треков"
         else:
             data = await extract(query)
             track = Track(
                 title=data.get("title") or "Без названия",
                 page_url=data.get("webpage_url") or data.get("original_url") or query,
                 duration=data.get("duration"),
-                requester=requester,
+                requester=who,
                 thumbnail=data.get("thumbnail"),
             )
             try:
@@ -972,25 +1199,118 @@ async def play(interaction: discord.Interaction, query: str):
             except Exception as e:
                 log.warning("Не смог сохранить инфу о треке: %s", e)
             p.queue.append(track)
+            p.last_action = f"➕ {who} добавил «{track.title[:50]}»"
             found = f" (нашёл по «{external}»)" if external else ""
-            if p.current is None:
-                await interaction.followup.send(f"🎵 Запускаю {track.label()}{found}")
-            else:
-                await interaction.followup.send(f"➕ В очереди #{len(p.queue)}: {track.label()}{found}")
+            result = (f"🎵 Запускаю {track.label()}{found}" if p.current is None
+                      else f"➕ В очереди #{len(p.queue)}: {track.label()}{found}")
     except Exception as e:
-        log.warning("/play %r: %s", query, e)
-        if re.search(r"vk\.com|vk\.ru|^audio-?\d+_", query):
-            msg = "❌ Музыку из ВК достать не могу — она доступна только с аккаунта. Напиши название трека, найду на YouTube."
-        elif "://" in query or re.match(r"^\S+\.[a-z]{2,}/\S*$", query):
-            msg = ("❌ Не получилось открыть ссылку. Понимаю YouTube, SoundCloud, а также треки из Spotify и Яндекс Музыки. "
-                   "Можно просто написать название.")
-        else:
-            msg = f"❌ Не нашёл: {str(e).removeprefix('ERROR: ')[:200]}"
-        return await interaction.followup.send(msg)
+        return friendly_error(query, e)
 
     if p.current:
         await p.refresh_panel()
     p.start()
+    return result
+
+
+def quiet(interaction: discord.Interaction) -> bool:
+    """В музыкальном канале ответы видит только тот, кто спросил — чтобы канал оставался чистым."""
+    return bool(interaction.guild) and bot.player(interaction.guild).is_home(interaction.channel_id)
+
+
+async def say(interaction: discord.Interaction, text: str, **kw):
+    ephemeral = kw.pop("ephemeral", quiet(interaction))
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=ephemeral, **kw)
+    else:
+        await interaction.response.send_message(text, ephemeral=ephemeral, **kw)
+
+
+# ---------- музыкальный канал ----------
+
+@bot.tree.command(name="setup", description="Сделать этот канал музыкальным: плеер + заказ треков сообщениями")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+async def setup_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+    old = bot.config.get(str(guild.id), {})
+    if old.get("message") and old.get("channel") != interaction.channel_id:  # плеер переезжает — старый убираем
+        try:
+            ch = guild.get_channel(old["channel"])
+            if ch:
+                await (await ch.fetch_message(old["message"])).delete()
+        except discord.HTTPException:
+            pass
+    bot.config[str(guild.id)] = {"channel": interaction.channel_id, "message": None}
+    bot.save_config()
+    p = bot.player(guild)
+    p.panel = None
+    await p.refresh_panel()
+
+    notes = []
+    perms = interaction.channel.permissions_for(guild.me)
+    if bot.intents.message_content:
+        notes.append("✍️ Можно просто писать название трека в этот канал — я добавлю его и уберу сообщение.")
+        if not perms.manage_messages:
+            notes.append("⚠️ Дай мне право **«Управлять сообщениями»** в этом канале, иначе не смогу убирать заказы из чата.")
+    else:
+        notes.append("ℹ️ Заказ треков сообщениями выключен: включи **Message Content Intent** в Developer Portal "
+                     "и перезапусти меня. Пока добавляй через кнопку ➕.")
+    await interaction.followup.send("✅ Плеер теперь живёт в этом канале.\n" + "\n".join(notes), ephemeral=True)
+
+
+@bot.listen("on_message")
+async def music_channel_requests(message: discord.Message):
+    """В музыкальном канале любое сообщение — заказ трека."""
+    if not message.guild or message.author.bot:
+        return
+    p = bot.player(message.guild)
+    if not p.is_home(message.channel.id):
+        return
+    text = message.content.strip()
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    if not text:
+        return
+    async with message.channel.typing():
+        result = await add_from(message.guild, message.author, text, message.channel)
+    if result.startswith("❌"):
+        await message.channel.send(f"{message.author.mention} {result}", delete_after=10)
+
+
+# ---------- команды ----------
+
+@bot.tree.command(name="join", description="Подключиться к вашему голосовому каналу")
+@app_commands.guild_only()
+async def join(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=quiet(interaction))
+    vc, err = await connect_member(interaction.user)
+    if err:
+        return await say(interaction, err)
+    bot.player(interaction.guild).start()  # запустит таймер простоя, если играть нечего
+    await say(interaction, f"✅ Я в {vc.channel.mention}")
+
+
+@bot.tree.command(name="leave", description="Отключиться от голосового канала")
+@app_commands.guild_only()
+async def leave(interaction: discord.Interaction):
+    if not interaction.guild.voice_client:
+        return await say(interaction, "❌ Я не в голосовом канале.")
+    p = bot.player(interaction.guild)
+    p.last_action = f"👋 {interaction.user.display_name} выгнал меня из канала"
+    await p.disconnect()
+    await say(interaction, "👋 Покинул канал.")
+
+
+@bot.tree.command(name="play", description="Трек или плейлист: ссылка (YouTube, Spotify, Яндекс Музыка) или название")
+@app_commands.describe(query="Начни вводить название — появятся подсказки. Или вставь ссылку")
+@app_commands.guild_only()
+async def play(interaction: discord.Interaction, query: str):
+    await interaction.response.defer(ephemeral=quiet(interaction))
+    result = await add_from(interaction.guild, interaction.user, query, interaction.channel)
+    await say(interaction, result)
 
 
 _suggest_cache: dict[str, list[tuple[str, str]]] = {}
@@ -1018,15 +1338,22 @@ async def play_autocomplete(interaction: discord.Interaction, current: str):
 @bot.tree.command(name="skip", description="Пропустить текущий трек")
 @app_commands.guild_only()
 async def skip(interaction: discord.Interaction):
-    ok = bot.player(interaction.guild).skip()
-    await interaction.response.send_message("⏭️ Пропущено." if ok else "🔇 Ничего не играет.")
+    p = bot.player(interaction.guild)
+    title = p.current.title if p.current else ""
+    ok = p.skip()
+    if ok:
+        p.last_action = f"⏭️ {interaction.user.display_name} пропустил «{title[:40]}»"
+    await say(interaction, "⏭️ Пропущено." if ok else "🔇 Ничего не играет.")
 
 
 @bot.tree.command(name="previous", description="Вернуть предыдущий трек")
 @app_commands.guild_only()
 async def previous(interaction: discord.Interaction):
-    ok = bot.player(interaction.guild).previous()
-    await interaction.response.send_message("⏮️ Возвращаю." if ok else "📭 История пуста.")
+    p = bot.player(interaction.guild)
+    ok = p.previous()
+    if ok:
+        p.last_action = f"⏮️ {interaction.user.display_name} вернул прошлый трек"
+    await say(interaction, "⏮️ Возвращаю." if ok else "📭 История пуста.")
 
 
 @bot.tree.command(name="pause", description="Пауза")
@@ -1034,7 +1361,9 @@ async def previous(interaction: discord.Interaction):
 async def pause(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
     ok = p.pause()
-    await interaction.response.send_message("⏸️ Пауза." if ok else "🔇 Ничего не играет.")
+    if ok:
+        p.last_action = f"⏸️ {interaction.user.display_name} поставил на паузу"
+    await say(interaction, "⏸️ Пауза." if ok else "🔇 Ничего не играет.")
     await p.refresh_panel()
 
 
@@ -1043,15 +1372,19 @@ async def pause(interaction: discord.Interaction):
 async def resume(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
     ok = p.resume()
-    await interaction.response.send_message("▶️ Продолжаю." if ok else "❌ Нечего продолжать.")
+    if ok:
+        p.last_action = f"▶️ {interaction.user.display_name} снял с паузы"
+    await say(interaction, "▶️ Продолжаю." if ok else "❌ Нечего продолжать.")
     await p.refresh_panel()
 
 
 @bot.tree.command(name="stop", description="Остановить музыку и очистить очередь")
 @app_commands.guild_only()
 async def stop(interaction: discord.Interaction):
-    bot.player(interaction.guild).stop()
-    await interaction.response.send_message("⏹️ Остановлено, очередь очищена.")
+    p = bot.player(interaction.guild)
+    p.stop()
+    p.last_action = f"⏹️ {interaction.user.display_name} остановил музыку"
+    await say(interaction, "⏹️ Остановлено, очередь очищена.")
 
 
 @bot.tree.command(name="loop", description="Режим повтора")
@@ -1065,7 +1398,8 @@ async def stop(interaction: discord.Interaction):
 async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
     p = bot.player(interaction.guild)
     p.loop_mode = mode.value
-    await interaction.response.send_message(f"🔁 Повтор: {LOOP_LABEL[mode.value]}")
+    p.last_action = f"🔁 {interaction.user.display_name}: повтор — {LOOP_LABEL[mode.value]}"
+    await say(interaction, f"🔁 Повтор: {LOOP_LABEL[mode.value]}")
     await p.refresh_panel()
 
 
@@ -1074,16 +1408,16 @@ async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
 async def autoplay_cmd(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
     p.autoplay = not p.autoplay
-    await interaction.response.send_message("📻 Автоплей включён." if p.autoplay else "📻 Автоплей выключен.")
+    p.last_action = f"📻 {interaction.user.display_name}: автоплей {'включён' if p.autoplay else 'выключен'}"
+    await say(interaction, "📻 Автоплей включён." if p.autoplay else "📻 Автоплей выключен.")
     await p.refresh_panel()
 
 
 def parse_time(text: str) -> float:
     """'90', '1:30', '1:02:03' → секунды."""
-    parts = [float(x) for x in text.strip().split(":")]
     sec = 0.0
-    for x in parts:
-        sec = sec * 60 + x
+    for x in text.strip().split(":"):
+        sec = sec * 60 + float(x)
     return sec
 
 
@@ -1093,18 +1427,19 @@ def parse_time(text: str) -> float:
 async def seek(interaction: discord.Interaction, position: str):
     p = bot.player(interaction.guild)
     if not p.current:
-        return await interaction.response.send_message("🔇 Ничего не играет.")
+        return await say(interaction, "🔇 Ничего не играет.")
     if not p.current.duration:
-        return await interaction.response.send_message("❌ Это прямой эфир — его не перемотать.")
+        return await say(interaction, "❌ Это прямой эфир — его не перемотать.")
     try:
         text = position.strip()
-        pos = p.elapsed() + parse_time(text[1:]) * (1 if text[0] == "+" else -1) if text[0] in "+-" else parse_time(text)
+        pos = (p.elapsed() + parse_time(text[1:]) * (1 if text[0] == "+" else -1)) if text[0] in "+-" else parse_time(text)
     except (ValueError, IndexError):
-        return await interaction.response.send_message("❌ Не понял время. Примеры: `1:30`, `90`, `+15`, `-10`.")
+        return await say(interaction, "❌ Не понял время. Примеры: `1:30`, `90`, `+15`, `-10`.")
     pos = min(max(0.0, pos), p.current.duration - 1)
     if not p.restart_at(pos):
-        return await interaction.response.send_message("🔇 Ничего не играет.")
-    await interaction.response.send_message(f"⏩ Перематываю на `{fmt_time(pos)}`…")
+        return await say(interaction, "🔇 Ничего не играет.")
+    p.last_action = f"⏩ {interaction.user.display_name} перемотал на {fmt_time(pos)}"
+    await say(interaction, f"⏩ Перематываю на `{fmt_time(pos)}`…")
 
 
 @bot.tree.command(name="effect", description="Эффект звука: bass boost, nightcore, slowed, 8D")
@@ -1116,14 +1451,16 @@ async def effect(interaction: discord.Interaction, name: app_commands.Choice[str
     pos = p.elapsed() if p.current else 0.0
     p.effect = name.value
     applied = p.restart_at(pos)
-    note = " (применится через пару секунд)" if applied else ""
-    await interaction.response.send_message(f"🎛️ Эффект: **{EFFECT_LABEL[name.value]}**{note}")
+    p.last_action = f"🎛️ {interaction.user.display_name}: эффект — {EFFECT_LABEL[name.value]}"
+    await say(interaction, f"🎛️ Эффект: **{EFFECT_LABEL[name.value]}**" + (" (применится через пару секунд)" if applied else ""))
+    if not applied:
+        await p.refresh_panel()
 
 
 @bot.tree.command(name="queue", description="Показать очередь")
 @app_commands.guild_only()
 async def queue_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(queue_text(bot.player(interaction.guild)))
+    await say(interaction, queue_text(bot.player(interaction.guild)))
 
 
 @bot.tree.command(name="history", description="Что недавно играло")
@@ -1131,20 +1468,23 @@ async def queue_cmd(interaction: discord.Interaction):
 async def history_cmd(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
     if not p.history:
-        return await interaction.response.send_message("📭 Пока ничего не играло.")
+        return await say(interaction, "📭 Пока ничего не играло.")
     items = list(p.history)[::-1][:10]
     lines = [f"`{i}.` [{t.title[:70]}]({t.page_url}) — {t.requester}" for i, t in enumerate(items, 1)]
-    await interaction.response.send_message("🕘 Недавно играло:\n" + "\n".join(lines), suppress_embeds=True)
+    await say(interaction, "🕘 Недавно играло:\n" + "\n".join(lines), suppress_embeds=True)
 
 
 @bot.tree.command(name="nowplaying", description="Показать панель плеера заново")
 @app_commands.guild_only()
 async def nowplaying(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
+    if p.home_channel_id:
+        await say(interaction, f"👆 Плеер живёт в <#{p.home_channel_id}>.", ephemeral=True)
+        return await p.refresh_panel()
     if not p.current:
-        return await interaction.response.send_message("🔇 Ничего не играет.")
+        return await say(interaction, "🔇 Ничего не играет.")
     p.text_channel = interaction.channel
-    await interaction.response.send_message("👇", ephemeral=True)
+    await say(interaction, "👇", ephemeral=True)
     await p.show_panel()
 
 
@@ -1154,8 +1494,11 @@ async def nowplaying(interaction: discord.Interaction):
 async def volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]):
     p = bot.player(interaction.guild)
     p.volume = level / 100
+    p.last_action = f"🔊 {interaction.user.display_name}: громкость {level}%"
     applied = p.restart_at()  # ffmpeg применит громкость, перезапустив трек с того же места
-    await interaction.response.send_message(f"🔊 Громкость: {level}%" + (" (применится через пару секунд)" if applied else ""))
+    await say(interaction, f"🔊 Громкость: {level}%" + (" (применится через пару секунд)" if applied else ""))
+    if not applied:
+        await p.refresh_panel()
 
 
 @bot.tree.command(name="shuffle", description="Перемешать очередь")
@@ -1163,7 +1506,9 @@ async def volume(interaction: discord.Interaction, level: app_commands.Range[int
 async def shuffle(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
     ok = p.shuffle()
-    await interaction.response.send_message("🔀 Очередь перемешана." if ok else "❌ Нечего перемешивать.")
+    if ok:
+        p.last_action = f"🔀 {interaction.user.display_name} перемешал очередь"
+    await say(interaction, "🔀 Очередь перемешана." if ok else "❌ Нечего перемешивать.")
     await p.refresh_panel()
 
 
@@ -1173,29 +1518,48 @@ async def shuffle(interaction: discord.Interaction):
 async def remove(interaction: discord.Interaction, position: app_commands.Range[int, 1]):
     p = bot.player(interaction.guild)
     if position > len(p.queue):
-        return await interaction.response.send_message("❌ Нет такого номера.")
+        return await say(interaction, "❌ Нет такого номера.")
     track = p.queue[position - 1]
     del p.queue[position - 1]
-    await interaction.response.send_message(f"🗑️ Убрал {track.label()}")
+    track.drop_info()
+    p.last_action = f"🗑️ {interaction.user.display_name} убрал «{track.title[:40]}»"
+    await say(interaction, f"🗑️ Убрал {track.label()}")
     await p.refresh_panel()
 
 
 @bot.tree.command(name="stalker", description="Получить мудрость из Зоны")
 async def stalker(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📜 *{random.choice(STALKER_QUOTES)}*")
+    await say(interaction, f"📜 *{random.choice(STALKER_QUOTES)}*")
 
 
 @bot.tree.error
 async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     log.exception("Ошибка команды", exc_info=error)
-    msg = f"❌ Ошибка: {error}"
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    try:
+        await say(interaction, f"❌ Ошибка: {error}", ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+def message_content_allowed() -> bool:
+    """Включён ли у бота Message Content Intent в Developer Portal (иначе Discord не пустит с этим правом)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request("https://discord.com/api/v10/applications/@me",
+                                     headers={"Authorization": f"Bot {TOKEN}", "User-Agent": "DiscordBot (dj-bot, 1.0)"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            flags = json.load(r).get("flags", 0)
+        return bool(flags & ((1 << 18) | (1 << 19)))  # GATEWAY_MESSAGE_CONTENT (+ LIMITED)
+    except Exception as e:
+        log.warning("Не смог проверить Message Content Intent: %s", e)
+        return False
 
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("[CRITICAL] Нет DISCORD_TOKEN в .env")
+    allowed = message_content_allowed()
+    bot._connection._intents.message_content = allowed
+    log.info("Заказ треков сообщениями в музыкальном канале: %s", "включён" if allowed else
+             "выключен (включи Message Content Intent в Developer Portal)")
     bot.run(TOKEN, log_handler=None)
