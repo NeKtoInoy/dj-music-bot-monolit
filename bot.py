@@ -41,6 +41,19 @@ AUTOPLAY_BATCH = 3              # сколько похожих треков д�
 YTDLP_UPDATE_EVERY = 24 * 3600  # сек: как часто проверять обновления yt-dlp (только в Docker)
 INFO_TTL = 30 * 60               # сек: сколько живёт сохранённая инфа о треке (ссылки YouTube протухают)
 PANEL_COLOR = 0x1D9E75
+OPUS_BITRATE = 128              # кбит/с: ffmpeg сразу отдаёт сжатый звук, боту не надо его кодировать
+STATE_PATH = os.getenv("STATE_PATH", os.path.expanduser("~/.cache/dj-bot/state.json"))
+STATE_SAVE_EVERY = 10           # сек: как часто сохранять очередь (чтобы пережить перезапуск)
+
+# эффекты: название → (фильтр ffmpeg, во сколько раз меняется скорость)
+EFFECTS = {
+    "none": ("", 1.0),
+    "bassboost": ("bass=g=10:f=110:w=0.6", 1.0),
+    "nightcore": ("asetrate=60000,aresample=48000", 1.25),
+    "slowed": ("asetrate=38400,aresample=48000", 0.8),
+    "8d": ("apulsator=hz=0.08", 1.0),
+}
+EFFECT_LABEL = {"none": "нет", "bassboost": "bass boost", "nightcore": "nightcore", "slowed": "slowed", "8d": "8D"}
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -112,6 +125,17 @@ class Track:
     thumbnail: str | None = None
     info_path: str | None = None   # сохранённый ответ yt-dlp, чтобы не искать трек второй раз
     info_time: float = 0.0
+    start_at: float = 0.0          # с какой секунды начать (после перезапуска бота)
+
+    def to_dict(self) -> dict:
+        return {"title": self.title, "page_url": self.page_url, "duration": self.duration,
+                "requester": self.requester, "thumbnail": self.thumbnail, "start_at": self.start_at}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Track":
+        return cls(title=d["title"], page_url=d["page_url"], duration=d.get("duration"),
+                   requester=d.get("requester", "?"), thumbnail=d.get("thumbnail"),
+                   start_at=float(d.get("start_at") or 0))
 
     def drop_info(self):
         if self.info_path:
@@ -148,19 +172,23 @@ def save_info(data: dict) -> str:
     return path
 
 
-def open_audio(track: "Track") -> tuple[subprocess.Popen, discord.FFmpegPCMAudio]:
+def open_audio(track: "Track", start: float = 0.0, af: str = "") -> tuple[subprocess.Popen, discord.FFmpegOpusAudio]:
     """yt-dlp качает звук кусками и отдаёт его ffmpeg через трубу.
     Прямую ссылку ffmpeg YouTube теперь часто режет ошибкой 403.
-    Если инфа о треке уже есть (её достали в /play) — отдаём её yt-dlp, чтобы он не искал трек заново."""
+    Если инфа о треке уже есть (её достали в /play) — отдаём её yt-dlp, чтобы он не искал трек заново.
+    ffmpeg сам накладывает громкость и эффекты (af) и сразу жмёт в opus — так меньше нагрузка на процессор."""
     fresh = track.info_path and os.path.exists(track.info_path) and time.time() - track.info_time < INFO_TTL
-    source = ["--load-info-json", track.info_path] if fresh else [track.page_url]
+    src = ["--load-info-json", track.info_path] if fresh else [track.page_url]
     proc = subprocess.Popen(
         [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
          "--downloader", "native", "--http-chunk-size", "10M",
-         "-f", "bestaudio/best", "-o", "-", *source],
+         "-f", "bestaudio/best", "-o", "-", *src],
         stdout=subprocess.PIPE,
     )
-    audio = discord.FFmpegPCMAudio(proc.stdout, pipe=True, before_options="-nostdin", options="-vn")
+    before = "-nostdin" + (f" -ss {start:.2f}" if start > 0.5 else "")
+    options = "-vn" + (f' -af "{af}"' if af else "")
+    audio = discord.FFmpegOpusAudio(proc.stdout, pipe=True, bitrate=OPUS_BITRATE,
+                                    before_options=before, options=options)
     return proc, audio
 
 
@@ -169,7 +197,7 @@ class Prepared:
     """Трек, который уже начали грузить заранее."""
     track: Track
     proc: subprocess.Popen
-    audio: discord.FFmpegPCMAudio
+    audio: discord.FFmpegOpusAudio
 
     def kill(self):
         try:
@@ -287,6 +315,10 @@ class GuildPlayer:
         self.skip_requested = False
         self.stop_requested = False
         self.back_requested = False
+        self.restart_requested = False   # перезапуск текущего трека с позиции (перемотка, эффект, громкость)
+        self.restart_pos = 0.0
+        self.effect = "none"
+        self.seg_offset = 0.0            # с какой секунды трека начался текущий отрезок
         self.started_at = 0.0
         self.paused_at: float | None = None
         self.paused_total = 0.0
@@ -299,9 +331,44 @@ class GuildPlayer:
     def is_paused(self) -> bool:
         return bool(self.vc and self.vc.is_paused())
 
+    @property
+    def speed(self) -> float:
+        return EFFECTS[self.effect][1]
+
+    def audio_filter(self) -> str:
+        parts = [EFFECTS[self.effect][0]]
+        if abs(self.volume - 1.0) > 0.01:
+            parts.append(f"volume={self.volume:.2f}")
+        return ",".join(p for p in parts if p)
+
     def elapsed(self) -> float:
+        """Позиция в треке (в секундах самого трека, с учётом скорости эффекта)."""
         end = self.paused_at or time.monotonic()
-        return max(0.0, end - self.started_at - self.paused_total)
+        return max(0.0, self.seg_offset + (end - self.started_at - self.paused_total) * self.speed)
+
+    def restart_at(self, pos: float | None = None) -> bool:
+        """Перезапускает текущий трек с позиции — так работают перемотка, эффекты и громкость."""
+        if not self.current or not self.vc or not (self.vc.is_playing() or self.vc.is_paused()):
+            return False
+        self.restart_pos = self.elapsed() if pos is None else max(0.0, pos)
+        self.restart_requested = True
+        self.drop_prefetch()  # заготовка следующего трека сделана со старыми настройками
+        self.vc.stop()
+        return True
+
+    def snapshot(self) -> dict | None:
+        """Состояние для сохранения на диск."""
+        vc = self.vc
+        if not vc or not vc.is_connected() or (not self.current and not self.queue):
+            return None
+        tracks = []
+        if self.current:
+            d = self.current.to_dict()
+            d["start_at"] = round(self.elapsed(), 1)
+            tracks.append(d)
+        tracks += [t.to_dict() for t in list(self.queue)[:300]]
+        return {"voice": vc.channel.id, "text": getattr(self.text_channel, "id", None), "tracks": tracks,
+                "volume": self.volume, "loop": self.loop_mode, "autoplay": self.autoplay, "effect": self.effect}
 
     async def send(self, text: str):
         if self.text_channel:
@@ -418,7 +485,7 @@ class GuildPlayer:
                     if not (self.prefetched and self.prefetched.track is nxt):
                         self.drop_prefetch()
                         try:
-                            proc, audio = open_audio(nxt)
+                            proc, audio = open_audio(nxt, 0.0, self.audio_filter())
                             self.prefetched = Prepared(nxt, proc, audio)
                             log.info("Заранее гружу: %s", nxt.title)
                         except Exception as e:
@@ -464,41 +531,54 @@ class GuildPlayer:
 
             track = self.queue.popleft()
             self.current = track
-            prep = self.take_prefetched(track)
-            if prep:
-                proc, audio = prep.proc, prep.audio
-            else:
-                try:
-                    proc, audio = open_audio(track)
-                except Exception as e:
-                    log.warning("Не загрузился %s: %s", track.title, e)
-                    await self.send(f"❌ Не смог загрузить {track.label()}: {e}")
+            start, first, failed = track.start_at, True, False
+            track.start_at = 0.0
+            while True:  # один трек может играть несколькими «отрезками» (перемотка, эффект, громкость)
+                prep = self.take_prefetched(track) if start == 0 else None
+                if prep:
+                    proc, audio = prep.proc, prep.audio
+                else:
+                    try:
+                        proc, audio = open_audio(track, start, self.audio_filter())
+                    except Exception as e:
+                        log.warning("Не загрузился %s: %s", track.title, e)
+                        await self.send(f"❌ Не смог загрузить {track.label()}: {e}")
+                        failed = True
+                        break
+
+                done = asyncio.Event()
+
+                def after(err):
+                    if err:
+                        log.error("Ошибка воспроизведения: %s", err)
+                    self.bot.loop.call_soon_threadsafe(done.set)
+
+                self.skip_requested = self.back_requested = self.restart_requested = False
+                self.seg_offset = start
+                self.started_at = time.monotonic()
+                self.paused_at = None
+                self.paused_total = 0.0
+                vc.play(audio, after=after)
+                if first:
+                    first = False
+                    await self.bot.set_listening(track.title)
+                    await self.show_panel()
+                    asyncio.create_task(self._prefetch_near_end(track))
+                else:
+                    await self.refresh_panel()
+                await done.wait()
+
+                rc = proc.poll()  # код выхода yt-dlp (None — ещё работает, например при пропуске)
+                if rc is None:
+                    proc.kill()
+                await asyncio.get_running_loop().run_in_executor(None, proc.wait)
+                if self.restart_requested and self.vc and self.vc.is_connected():
+                    start = self.restart_pos
                     continue
-            source = discord.PCMVolumeTransformer(audio, volume=self.volume)
-
-            done = asyncio.Event()
-
-            def after(err):
-                if err:
-                    log.error("Ошибка воспроизведения: %s", err)
-                self.bot.loop.call_soon_threadsafe(done.set)
-
-            self.skip_requested = False
-            self.back_requested = False
-            self.started_at = time.monotonic()
-            self.paused_at = None
-            self.paused_total = 0.0
-            vc.play(source, after=after)
-            await self.bot.set_listening(track.title)
-            await self.show_panel()
-            asyncio.create_task(self._prefetch_near_end(track))
-            await done.wait()
-
-            rc = proc.poll()  # код выхода yt-dlp (None — ещё работает, например при пропуске)
-            if rc is None:
-                proc.kill()
-            await asyncio.get_running_loop().run_in_executor(None, proc.wait)
+                break
             track.drop_info()  # инфа одноразовая: при повторе трека yt-dlp возьмёт свежую
+            if failed:
+                continue
 
             # yt-dlp упал, а трек никто не пропускал — значит YouTube не отдал звук
             if rc not in (None, 0) and not (self.skip_requested or self.stop_requested or self.back_requested):
@@ -547,6 +627,7 @@ class GuildPlayer:
         e.set_footer(
             text=f"Заказал {t.requester} · громкость {round(self.volume * 100)}% · "
                  f"повтор: {LOOP_LABEL[self.loop_mode]} · автоплей: {'вкл' if self.autoplay else 'выкл'}"
+                 + (f" · эффект: {EFFECT_LABEL[self.effect]}" if self.effect != "none" else "")
         )
         return e
 
@@ -676,6 +757,8 @@ class DJBot(commands.Bot):
         intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
         self.players: dict[int, GuildPlayer] = {}
+        self._restored = False
+        self._last_state = ""
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -695,6 +778,59 @@ class DJBot(commands.Bot):
         log.info("Синхронизировано слэш-команд: %d", len(synced))
         if os.path.exists("/.dockerenv"):  # в Docker перезапуск после обновления сделает сам Docker
             asyncio.create_task(self.ytdlp_updater())
+        asyncio.create_task(self.state_saver())
+
+    async def state_saver(self):
+        """Каждые несколько секунд сохраняет очереди на диск — чтобы пережить перезапуск."""
+        await self.wait_until_ready()
+        while True:
+            await asyncio.sleep(STATE_SAVE_EVERY)
+            if not self._restored:
+                continue
+            try:
+                state = {str(gid): snap for gid, p in self.players.items() if (snap := p.snapshot())}
+                text = json.dumps(state, ensure_ascii=False)
+                if text != self._last_state:
+                    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+                    tmp = STATE_PATH + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    os.replace(tmp, STATE_PATH)
+                    self._last_state = text
+            except Exception as e:
+                log.warning("Не смог сохранить очередь: %s", e)
+
+    async def restore_state(self):
+        """После перезапуска возвращается в каналы и продолжает играть с того же места."""
+        try:
+            with open(STATE_PATH, encoding="utf-8") as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log.warning("Не смог прочитать сохранённую очередь: %s", e)
+            return
+        for gid, d in state.items():
+            try:
+                guild = self.get_guild(int(gid))
+                channel = guild and guild.get_channel(d["voice"])
+                if not isinstance(channel, discord.VoiceChannel) or not any(not m.bot for m in channel.members):
+                    continue  # в канале никого — не врываемся
+                if not guild.voice_client:
+                    await channel.connect()
+                p = self.player(guild)
+                p.text_channel = guild.get_channel(d.get("text")) if d.get("text") else None
+                p.volume = float(d.get("volume", 0.5))
+                p.loop_mode = d.get("loop", "off") if d.get("loop") in LOOP_LABEL else "off"
+                p.autoplay = bool(d.get("autoplay"))
+                p.effect = d.get("effect", "none") if d.get("effect") in EFFECTS else "none"
+                p.queue.extend(Track.from_dict(t) for t in d.get("tracks", []))
+                if p.queue:
+                    await p.send(f"♻️ Я перезапускался — продолжаю с того же места ({len(p.queue)} в очереди).")
+                    p.start()
+                log.info("Восстановил очередь на сервере %s: %d треков", guild.name, len(p.queue))
+            except Exception as e:
+                log.warning("Не смог восстановить сервер %s: %s", gid, e)
 
     async def ytdlp_updater(self):
         """Раз в сутки обновляет yt-dlp. Если вышла новая версия — дожидается тишины и перезапускает бота."""
@@ -734,6 +870,9 @@ class DJBot(commands.Bot):
         if not discord.opus.is_loaded():
             log.warning("Нет libopus! Звук работать не будет (apt install libopus0).")
         log.info("Бот %s запущен и готов к музыке!", self.user)
+        if not self._restored:
+            self._restored = True
+            await self.restore_state()
 
     async def on_voice_state_update(self, member, before, after):
         guild = member.guild
@@ -939,6 +1078,48 @@ async def autoplay_cmd(interaction: discord.Interaction):
     await p.refresh_panel()
 
 
+def parse_time(text: str) -> float:
+    """'90', '1:30', '1:02:03' → секунды."""
+    parts = [float(x) for x in text.strip().split(":")]
+    sec = 0.0
+    for x in parts:
+        sec = sec * 60 + x
+    return sec
+
+
+@bot.tree.command(name="seek", description="Перемотка: 1:30 — на позицию, +15 / -15 — вперёд/назад")
+@app_commands.describe(position="Например 1:30, 90, +15 или -10")
+@app_commands.guild_only()
+async def seek(interaction: discord.Interaction, position: str):
+    p = bot.player(interaction.guild)
+    if not p.current:
+        return await interaction.response.send_message("🔇 Ничего не играет.")
+    if not p.current.duration:
+        return await interaction.response.send_message("❌ Это прямой эфир — его не перемотать.")
+    try:
+        text = position.strip()
+        pos = p.elapsed() + parse_time(text[1:]) * (1 if text[0] == "+" else -1) if text[0] in "+-" else parse_time(text)
+    except (ValueError, IndexError):
+        return await interaction.response.send_message("❌ Не понял время. Примеры: `1:30`, `90`, `+15`, `-10`.")
+    pos = min(max(0.0, pos), p.current.duration - 1)
+    if not p.restart_at(pos):
+        return await interaction.response.send_message("🔇 Ничего не играет.")
+    await interaction.response.send_message(f"⏩ Перематываю на `{fmt_time(pos)}`…")
+
+
+@bot.tree.command(name="effect", description="Эффект звука: bass boost, nightcore, slowed, 8D")
+@app_commands.describe(name="Какой эффект")
+@app_commands.choices(name=[app_commands.Choice(name=v, value=k) for k, v in EFFECT_LABEL.items()])
+@app_commands.guild_only()
+async def effect(interaction: discord.Interaction, name: app_commands.Choice[str]):
+    p = bot.player(interaction.guild)
+    pos = p.elapsed() if p.current else 0.0
+    p.effect = name.value
+    applied = p.restart_at(pos)
+    note = " (применится через пару секунд)" if applied else ""
+    await interaction.response.send_message(f"🎛️ Эффект: **{EFFECT_LABEL[name.value]}**{note}")
+
+
 @bot.tree.command(name="queue", description="Показать очередь")
 @app_commands.guild_only()
 async def queue_cmd(interaction: discord.Interaction):
@@ -973,11 +1154,8 @@ async def nowplaying(interaction: discord.Interaction):
 async def volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]):
     p = bot.player(interaction.guild)
     p.volume = level / 100
-    vc = interaction.guild.voice_client
-    if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
-        vc.source.volume = p.volume
-    await interaction.response.send_message(f"🔊 Громкость: {level}%")
-    await p.refresh_panel()
+    applied = p.restart_at()  # ffmpeg применит громкость, перезапустив трек с того же места
+    await interaction.response.send_message(f"🔊 Громкость: {level}%" + (" (применится через пару секунд)" if applied else ""))
 
 
 @bot.tree.command(name="shuffle", description="Перемешать очередь")
