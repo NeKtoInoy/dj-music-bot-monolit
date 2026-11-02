@@ -194,16 +194,38 @@ def open_audio(track: "Track", start: float = 0.0, af: str = "") -> tuple[subpro
 
 
 class PrimedSource(discord.AudioSource):
-    """Обёртка: сначала отдаёт заранее прочитанный кадр, потом читает дальше как обычно."""
+    """Обёртка над звуком: может отдать заранее прочитанный первый кадр (для бесшовной подмены)
+    и заодно замеряет, не опаздывает ли звук — пишет в лог, если были рывки."""
 
-    def __init__(self, inner: discord.AudioSource, first: bytes):
+    def __init__(self, inner: discord.AudioSource, first: bytes | None = None):
         self.inner, self.first = inner, first
+        self.last_call = 0.0
+        self.frames = self.slow_reads = self.late_calls = 0
+        self.max_read = self.max_gap = 0.0
 
     def read(self) -> bytes:
+        now = time.perf_counter()
+        if self.last_call:
+            gap = now - self.last_call
+            if gap > 0.035:  # плеер discord.py сам опоздал с запросом кадра — процессор был занят
+                self.late_calls += 1
+                self.max_gap = max(self.max_gap, gap)
         if self.first is not None:
             frame, self.first = self.first, None
-            return frame
-        return self.inner.read()
+        else:
+            frame = self.inner.read()
+        took = time.perf_counter() - now
+        if took > 0.015:  # кадр готовился дольше нормы — звук не успевал из yt-dlp/ffmpeg
+            self.slow_reads += 1
+            self.max_read = max(self.max_read, took)
+        self.last_call = time.perf_counter()
+        self.frames += 1
+        if self.frames % 1500 == 0 and (self.slow_reads or self.late_calls):  # раз в ~30 сек
+            log.info("Рывки звука за 30с: медленных кадров %d (макс %.0f мс), опозданий плеера %d (макс %.0f мс)",
+                     self.slow_reads, self.max_read * 1000, self.late_calls, self.max_gap * 1000)
+            self.slow_reads = self.late_calls = 0
+            self.max_read = self.max_gap = 0.0
+        return frame
 
     def is_opus(self) -> bool:
         return self.inner.is_opus()
@@ -621,7 +643,7 @@ class GuildPlayer:
                 self.paused_at = None
                 self.paused_total = 0.0
                 self.cur_proc = proc
-                vc.play(audio, after=after)
+                vc.play(PrimedSource(audio), after=after)
                 await self.bot.set_listening(track.title)
                 await self.show_panel()
                 asyncio.create_task(self._prefetch_near_end(track))
