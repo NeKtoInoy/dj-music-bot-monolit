@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -28,15 +29,24 @@ YTDL_OPTS = {
     "extractor_retries": 3,
     "socket_timeout": 10,
 }
+# для плейлистов: только список треков, без загрузки каждого
+YTDL_FLAT_OPTS = {**YTDL_OPTS, "noplaylist": False, "extract_flat": "in_playlist"}
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin",
     "options": "-vn",
 }
 
-ALONE_TIMEOUT = 60  # сек: выйти, если в канале никого не осталось
+ALONE_TIMEOUT = 60      # сек: выйти, если в канале никого не осталось
+PANEL_REFRESH = 15      # сек: как часто обновлять панель (чаще — упрёмся в лимиты Discord)
+MAX_PLAYLIST = 100      # сколько треков максимум брать из плейлиста
+PANEL_COLOR = 0x1D9E75
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
+ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTS)
+
+LOOP_NEXT = {"off": "queue", "queue": "track", "track": "off"}
+LOOP_LABEL = {"off": "выкл", "queue": "очередь", "track": "трек"}
 
 STALKER_QUOTES = [
     "Зона не прощает ошибок. Только — шансов.",
@@ -53,12 +63,19 @@ STALKER_QUOTES = [
 
 
 def fmt_time(seconds) -> str:
-    if not seconds:
-        return "??:??"
+    if seconds is None:
+        return "--:--"
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+def progress_bar(elapsed: float, duration, size: int = 16) -> str:
+    if not duration:
+        return "🔴 эфир"
+    pos = min(int(elapsed / duration * (size - 1)), size - 1)
+    return "▬" * pos + "🔘" + "▬" * (size - 1 - pos)
 
 
 @dataclass
@@ -67,27 +84,56 @@ class Track:
     page_url: str
     duration: int | None
     requester: str
+    thumbnail: str | None = None
 
     def label(self) -> str:
         return f"**{self.title}** `{fmt_time(self.duration)}`"
 
 
-async def extract(query: str) -> dict:
-    """Ищет трек/ссылку через yt-dlp (в отдельном потоке, чтобы не вешать бота)."""
+def is_playlist(query: str) -> bool:
+    return query.startswith("http") and ("list=" in query or "/playlist" in query or "/sets/" in query)
+
+
+async def run_ytdl(ydl: yt_dlp.YoutubeDL, query: str) -> dict:
+    """yt-dlp в отдельном потоке, чтобы не вешать бота."""
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
-    if data and "entries" in data:
-        entries = [e for e in data["entries"] if e]
-        if not entries:
-            raise LookupError("ничего не найдено")
-        data = entries[0]
+    data = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
     if not data:
         raise LookupError("ничего не найдено")
     return data
 
 
+async def extract(query: str) -> dict:
+    data = await run_ytdl(ytdl, query)
+    if "entries" in data:
+        entries = [e for e in data["entries"] if e]
+        if not entries:
+            raise LookupError("ничего не найдено")
+        data = entries[0]
+    return data
+
+
+async def extract_playlist(query: str) -> tuple[str, list[dict]]:
+    data = await run_ytdl(ytdl_flat, query)
+    entries = [e for e in (data.get("entries") or []) if e][:MAX_PLAYLIST]
+    return data.get("title") or "плейлист", entries
+
+
+def queue_text(p: "GuildPlayer") -> str:
+    if p.current is None and not p.queue:
+        return "🔇 Очередь пуста."
+    lines = []
+    if p.current:
+        lines.append(f"▶️ Сейчас: {p.current.label()}")
+    for i, t in enumerate(list(p.queue)[:10], 1):
+        lines.append(f"`{i}.` {t.label()} — {t.requester}")
+    if len(p.queue) > 10:
+        lines.append(f"…и ещё {len(p.queue) - 10}")
+    return "\n".join(lines)
+
+
 class GuildPlayer:
-    """Очередь и воспроизведение для одного сервера."""
+    """Очередь, воспроизведение и панель для одного сервера."""
 
     def __init__(self, bot: commands.Bot, guild: discord.Guild):
         self.bot = bot
@@ -95,12 +141,29 @@ class GuildPlayer:
         self.queue: deque[Track] = deque()
         self.current: Track | None = None
         self.volume = 0.5
+        self.loop_mode = "off"
         self.text_channel: discord.abc.Messageable | None = None
         self.task: asyncio.Task | None = None
+        self.updater: asyncio.Task | None = None
+        self.panel: discord.Message | None = None
+        self.view: PlayerView | None = None
+        self.skip_requested = False
+        self.stop_requested = False
+        self.started_at = 0.0
+        self.paused_at: float | None = None
+        self.paused_total = 0.0
 
     @property
     def vc(self) -> discord.VoiceClient | None:
         return self.guild.voice_client
+
+    @property
+    def is_paused(self) -> bool:
+        return bool(self.vc and self.vc.is_paused())
+
+    def elapsed(self) -> float:
+        end = self.paused_at or time.monotonic()
+        return max(0.0, end - self.started_at - self.paused_total)
 
     async def send(self, text: str):
         if self.text_channel:
@@ -109,9 +172,54 @@ class GuildPlayer:
             except discord.HTTPException:
                 pass
 
+    # ---------- управление ----------
+
     def start(self):
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._loop())
+
+    def pause(self) -> bool:
+        if self.vc and self.vc.is_playing():
+            self.vc.pause()
+            self.paused_at = time.monotonic()
+            return True
+        return False
+
+    def resume(self) -> bool:
+        if self.vc and self.vc.is_paused():
+            self.vc.resume()
+            if self.paused_at:
+                self.paused_total += time.monotonic() - self.paused_at
+            self.paused_at = None
+            return True
+        return False
+
+    def skip(self) -> bool:
+        if self.vc and (self.vc.is_playing() or self.vc.is_paused()):
+            self.skip_requested = True
+            self.vc.stop()  # after() запустит следующий трек
+            return True
+        return False
+
+    def stop(self):
+        self.queue.clear()
+        if self.skip():
+            self.stop_requested = True
+
+    def shuffle(self) -> bool:
+        if len(self.queue) < 2:
+            return False
+        items = list(self.queue)
+        random.shuffle(items)
+        self.queue = deque(items)
+        return True
+
+    async def disconnect(self):
+        self.stop()
+        if self.vc:
+            await self.vc.disconnect()
+
+    # ---------- цикл воспроизведения ----------
 
     async def _loop(self):
         while self.queue:
@@ -123,6 +231,8 @@ class GuildPlayer:
             try:
                 # ссылка на поток живёт недолго, поэтому берём её прямо перед игрой
                 data = await extract(track.page_url)
+                track.thumbnail = data.get("thumbnail") or track.thumbnail
+                track.duration = data.get("duration") or track.duration
                 source = discord.PCMVolumeTransformer(
                     discord.FFmpegPCMAudio(data["url"], **FFMPEG_OPTS), volume=self.volume
                 )
@@ -138,20 +248,149 @@ class GuildPlayer:
                     log.error("Ошибка воспроизведения: %s", err)
                 self.bot.loop.call_soon_threadsafe(done.set)
 
+            self.skip_requested = False
+            self.started_at = time.monotonic()
+            self.paused_at = None
+            self.paused_total = 0.0
             vc.play(source, after=after)
-            await self.send(f"▶️ Играет: {track.label()} — заказал {track.requester}")
+            await self.show_panel()
             await done.wait()
+
+            if self.stop_requested:
+                self.stop_requested = False
+                continue
+            if self.loop_mode == "track" and not self.skip_requested:
+                self.queue.appendleft(track)
+            elif self.loop_mode == "queue":
+                self.queue.append(track)
+
         self.current = None
+        await self.finish_panel()
 
-    def stop(self):
-        self.queue.clear()
-        if self.vc and (self.vc.is_playing() or self.vc.is_paused()):
-            self.vc.stop()
+    # ---------- панель ----------
 
-    async def disconnect(self):
-        self.stop()
-        if self.vc:
-            await self.vc.disconnect()
+    def build_embed(self) -> discord.Embed:
+        t = self.current
+        e = discord.Embed(title=t.title[:256], url=t.page_url, color=PANEL_COLOR)
+        e.set_author(name="⏸️ Пауза" if self.is_paused else "▶️ Сейчас играет")
+        el = self.elapsed()
+        e.description = f"`{fmt_time(el)}` {progress_bar(el, t.duration)} `{fmt_time(t.duration)}`"
+        if t.thumbnail:
+            e.set_thumbnail(url=t.thumbnail)
+        upcoming = list(self.queue)[:3]
+        value = "\n".join(f"`{i}.` {x.title[:60]}" for i, x in enumerate(upcoming, 1)) or "пусто"
+        if len(self.queue) > 3:
+            value += f"\n…и ещё {len(self.queue) - 3}"
+        e.add_field(name="Далее", value=value, inline=False)
+        e.set_footer(
+            text=f"Заказал {t.requester} · громкость {round(self.volume * 100)}% · повтор: {LOOP_LABEL[self.loop_mode]}"
+        )
+        return e
+
+    async def show_panel(self):
+        """Новая панель под каждый трек — чтобы она всегда была внизу чата."""
+        if not self.text_channel:
+            return
+        if self.panel:
+            try:
+                await self.panel.delete()
+            except discord.HTTPException:
+                pass
+        self.view = PlayerView(self)
+        try:
+            self.panel = await self.text_channel.send(embed=self.build_embed(), view=self.view)
+        except discord.HTTPException:
+            self.panel = None
+        if self.updater is None or self.updater.done():
+            self.updater = asyncio.create_task(self._update_panel())
+
+    async def refresh_panel(self):
+        if not (self.panel and self.current and self.view):
+            return
+        self.view.sync()
+        try:
+            await self.panel.edit(embed=self.build_embed(), view=self.view)
+        except discord.NotFound:
+            self.panel = None
+        except discord.HTTPException:
+            pass
+
+    async def _update_panel(self):
+        while self.current:
+            await asyncio.sleep(PANEL_REFRESH)
+            await self.refresh_panel()
+
+    async def finish_panel(self):
+        if self.panel:
+            try:
+                await self.panel.edit(
+                    embed=discord.Embed(description="⏹️ Очередь закончилась. `/play`, чтобы продолжить.", color=PANEL_COLOR),
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+            self.panel = None
+
+
+class PlayerView(discord.ui.View):
+    """Кнопки под панелью."""
+
+    def __init__(self, player: GuildPlayer):
+        super().__init__(timeout=None)
+        self.player = player
+        self.sync()
+
+    def sync(self):
+        self.pause_btn.emoji = "▶️" if self.player.is_paused else "⏸️"
+        self.loop_btn.emoji = "🔂" if self.player.loop_mode == "track" else "🔁"
+        self.loop_btn.style = (
+            discord.ButtonStyle.secondary if self.player.loop_mode == "off" else discord.ButtonStyle.success
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        vc = self.player.vc
+        voice = interaction.user.voice
+        if not vc or not voice or voice.channel != vc.channel:
+            await interaction.response.send_message("❌ Зайди в мой голосовой канал.", ephemeral=True)
+            return False
+        return True
+
+    async def redraw(self, interaction: discord.Interaction):
+        self.sync()
+        if self.player.current:
+            await interaction.response.edit_message(embed=self.player.build_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player.resume():
+            self.player.pause()
+        await self.redraw(interaction)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.skip()
+        await interaction.response.defer()  # новая панель появится сама
+
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.loop_mode = LOOP_NEXT[self.player.loop_mode]
+        await self.redraw(interaction)
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.shuffle()
+        await self.redraw(interaction)
+
+    @discord.ui.button(emoji="📜", style=discord.ButtonStyle.secondary)
+    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(queue_text(self.player), ephemeral=True)
 
 
 class DJBot(commands.Bot):
@@ -233,67 +472,79 @@ async def leave(interaction: discord.Interaction):
     await interaction.response.send_message("👋 Покинул канал.")
 
 
-@bot.tree.command(name="play", description="Добавить трек по ссылке или названию")
-@app_commands.describe(query="Ссылка или название трека")
+@bot.tree.command(name="play", description="Добавить трек или плейлист по ссылке или названию")
+@app_commands.describe(query="Ссылка (видео или плейлист) или название трека")
 @app_commands.guild_only()
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
     vc = await ensure_voice(interaction)
     if not vc:
         return
+    p = bot.player(interaction.guild)
+    p.text_channel = interaction.channel
+    requester = interaction.user.display_name
+
     try:
-        data = await extract(query)
+        if is_playlist(query):
+            title, entries = await extract_playlist(query)
+            tracks = [
+                Track(
+                    title=e.get("title") or "Без названия",
+                    page_url=e.get("url") or f"https://www.youtube.com/watch?v={e.get('id')}",
+                    duration=e.get("duration"),
+                    requester=requester,
+                )
+                for e in entries
+            ]
+            if not tracks:
+                return await interaction.followup.send("❌ Плейлист пустой или закрытый.")
+            p.queue.extend(tracks)
+            await interaction.followup.send(f"📃 Плейлист **{title}**: добавил {len(tracks)} треков")
+        else:
+            data = await extract(query)
+            track = Track(
+                title=data.get("title") or "Без названия",
+                page_url=data.get("webpage_url") or data.get("original_url") or query,
+                duration=data.get("duration"),
+                requester=requester,
+                thumbnail=data.get("thumbnail"),
+            )
+            p.queue.append(track)
+            if p.current is None:
+                await interaction.followup.send(f"🎵 Запускаю {track.label()}")
+            else:
+                await interaction.followup.send(f"➕ В очереди #{len(p.queue)}: {track.label()}")
     except Exception as e:
         return await interaction.followup.send(f"❌ Не нашёл: {e}")
 
-    track = Track(
-        title=data.get("title") or "Без названия",
-        page_url=data.get("webpage_url") or data.get("original_url") or query,
-        duration=data.get("duration"),
-        requester=interaction.user.display_name,
-    )
-    p = bot.player(interaction.guild)
-    p.text_channel = interaction.channel
-    p.queue.append(track)
-
-    if p.current is None:
-        await interaction.followup.send(f"🎵 Запускаю {track.label()}")
-    else:
-        await interaction.followup.send(f"➕ В очереди #{len(p.queue)}: {track.label()}")
+    if p.current:
+        await p.refresh_panel()
     p.start()
 
 
 @bot.tree.command(name="skip", description="Пропустить текущий трек")
 @app_commands.guild_only()
 async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()  # after() запустит следующий трек
-        await interaction.response.send_message("⏭️ Пропущено.")
-    else:
-        await interaction.response.send_message("🔇 Ничего не играет.")
+    ok = bot.player(interaction.guild).skip()
+    await interaction.response.send_message("⏭️ Пропущено." if ok else "🔇 Ничего не играет.")
 
 
 @bot.tree.command(name="pause", description="Пауза")
 @app_commands.guild_only()
 async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and vc.is_playing():
-        vc.pause()
-        await interaction.response.send_message("⏸️ Пауза.")
-    else:
-        await interaction.response.send_message("🔇 Ничего не играет.")
+    p = bot.player(interaction.guild)
+    ok = p.pause()
+    await interaction.response.send_message("⏸️ Пауза." if ok else "🔇 Ничего не играет.")
+    await p.refresh_panel()
 
 
 @bot.tree.command(name="resume", description="Продолжить воспроизведение")
 @app_commands.guild_only()
 async def resume(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and vc.is_paused():
-        vc.resume()
-        await interaction.response.send_message("▶️ Продолжаю.")
-    else:
-        await interaction.response.send_message("❌ Нечего продолжать.")
+    p = bot.player(interaction.guild)
+    ok = p.resume()
+    await interaction.response.send_message("▶️ Продолжаю." if ok else "❌ Нечего продолжать.")
+    await p.refresh_panel()
 
 
 @bot.tree.command(name="stop", description="Остановить музыку и очистить очередь")
@@ -303,30 +554,36 @@ async def stop(interaction: discord.Interaction):
     await interaction.response.send_message("⏹️ Остановлено, очередь очищена.")
 
 
+@bot.tree.command(name="loop", description="Режим повтора")
+@app_commands.describe(mode="Что повторять")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="выкл", value="off"),
+    app_commands.Choice(name="текущий трек", value="track"),
+    app_commands.Choice(name="всю очередь", value="queue"),
+])
+@app_commands.guild_only()
+async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    p = bot.player(interaction.guild)
+    p.loop_mode = mode.value
+    await interaction.response.send_message(f"🔁 Повтор: {LOOP_LABEL[mode.value]}")
+    await p.refresh_panel()
+
+
 @bot.tree.command(name="queue", description="Показать очередь")
 @app_commands.guild_only()
 async def queue_cmd(interaction: discord.Interaction):
-    p = bot.player(interaction.guild)
-    if p.current is None and not p.queue:
-        return await interaction.response.send_message("🔇 Очередь пуста.")
-    lines = []
-    if p.current:
-        lines.append(f"▶️ Сейчас: {p.current.label()}")
-    for i, t in enumerate(list(p.queue)[:10], 1):
-        lines.append(f"`{i}.` {t.label()} — {t.requester}")
-    if len(p.queue) > 10:
-        lines.append(f"…и ещё {len(p.queue) - 10}")
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.response.send_message(queue_text(bot.player(interaction.guild)))
 
 
-@bot.tree.command(name="nowplaying", description="Что сейчас играет")
+@bot.tree.command(name="nowplaying", description="Показать панель плеера заново")
 @app_commands.guild_only()
 async def nowplaying(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
-    if p.current:
-        await interaction.response.send_message(f"▶️ {p.current.label()} — заказал {p.current.requester}")
-    else:
-        await interaction.response.send_message("🔇 Ничего не играет.")
+    if not p.current:
+        return await interaction.response.send_message("🔇 Ничего не играет.")
+    p.text_channel = interaction.channel
+    await interaction.response.send_message("👇", ephemeral=True)
+    await p.show_panel()
 
 
 @bot.tree.command(name="volume", description="Громкость 0–100")
@@ -339,18 +596,16 @@ async def volume(interaction: discord.Interaction, level: app_commands.Range[int
     if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
         vc.source.volume = p.volume
     await interaction.response.send_message(f"🔊 Громкость: {level}%")
+    await p.refresh_panel()
 
 
 @bot.tree.command(name="shuffle", description="Перемешать очередь")
 @app_commands.guild_only()
 async def shuffle(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
-    if len(p.queue) < 2:
-        return await interaction.response.send_message("❌ Нечего перемешивать.")
-    items = list(p.queue)
-    random.shuffle(items)
-    p.queue = deque(items)
-    await interaction.response.send_message("🔀 Очередь перемешана.")
+    ok = p.shuffle()
+    await interaction.response.send_message("🔀 Очередь перемешана." if ok else "❌ Нечего перемешивать.")
+    await p.refresh_panel()
 
 
 @bot.tree.command(name="remove", description="Убрать трек из очереди по номеру")
@@ -363,6 +618,7 @@ async def remove(interaction: discord.Interaction, position: app_commands.Range[
     track = p.queue[position - 1]
     del p.queue[position - 1]
     await interaction.response.send_message(f"🗑️ Убрал {track.label()}")
+    await p.refresh_panel()
 
 
 @bot.tree.command(name="stalker", description="Получить мудрость из Зоны")
