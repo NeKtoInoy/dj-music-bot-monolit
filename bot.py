@@ -643,25 +643,6 @@ async def remove(interaction: discord.Interaction, position: app_commands.Range[
     await p.refresh_panel()
 
 
-@bot.tree.command(name="testtone", description="Тест звука: 5 секунд писка без YouTube")
-@app_commands.guild_only()
-async def testtone(interaction: discord.Interaction):
-    await interaction.response.defer()
-    vc = await ensure_voice(interaction)
-    if not vc:
-        return
-    if vc.is_playing() or vc.is_paused():
-        return await interaction.followup.send("❌ Сначала /stop.")
-    src = discord.FFmpegPCMAudio("sine=frequency=440:duration=5", before_options="-f lavfi")
-    vc.play(src, after=lambda e: log.info("testtone закончился, ошибка: %s", e))
-    c = vc._connection
-    ds = c.dave_session
-    log.info("testtone: opus=%s играет=%s | dave_ver=%s can_encrypt=%s ready=%s status=%s privacy_code=%s",
-             discord.opus.is_loaded(), vc.is_playing(), c.dave_protocol_version, c.can_encrypt,
-             getattr(ds, "ready", None), getattr(ds, "status", None), vc.voice_privacy_code)
-    await interaction.followup.send("🔊 Пищу 5 секунд. Слышно?")
-
-
 @bot.tree.command(name="stalker", description="Получить мудрость из Зоны")
 async def stalker(interaction: discord.Interaction):
     await interaction.response.send_message(f"📜 *{random.choice(STALKER_QUOTES)}*")
