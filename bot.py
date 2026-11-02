@@ -425,6 +425,7 @@ class DJBot(commands.Bot):
     async def on_ready(self):
         if shutil.which("ffmpeg") is None:
             log.warning("ffmpeg не найден! Музыка работать не будет.")
+        log.info("opus загружен: %s", discord.opus.is_loaded())
         log.info("Бот %s запущен и готов к музыке!", self.user)
 
     async def on_voice_state_update(self, member, before, after):
@@ -633,6 +634,21 @@ async def remove(interaction: discord.Interaction, position: app_commands.Range[
     del p.queue[position - 1]
     await interaction.response.send_message(f"🗑️ Убрал {track.label()}")
     await p.refresh_panel()
+
+
+@bot.tree.command(name="testtone", description="Тест звука: 5 секунд писка без YouTube")
+@app_commands.guild_only()
+async def testtone(interaction: discord.Interaction):
+    await interaction.response.defer()
+    vc = await ensure_voice(interaction)
+    if not vc:
+        return
+    if vc.is_playing() or vc.is_paused():
+        return await interaction.followup.send("❌ Сначала /stop.")
+    src = discord.FFmpegPCMAudio("sine=frequency=440:duration=5", before_options="-f lavfi")
+    vc.play(src, after=lambda e: log.info("testtone закончился, ошибка: %s", e))
+    log.info("testtone: opus=%s, играет=%s", discord.opus.is_loaded(), vc.is_playing())
+    await interaction.followup.send("🔊 Пищу 5 секунд. Слышно?")
 
 
 @bot.tree.command(name="stalker", description="Получить мудрость из Зоны")
