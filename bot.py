@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 
 load_dotenv()  # DISCORD_TOKEN берётся из .env
 TOKEN = os.getenv("DISCORD_TOKEN")
-VK_TOKEN = os.getenv("VK_TOKEN")  # необязательно: токен Kate Mobile, чтобы понимать ссылки на музыку ВК
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
 if os.getenv("VOICE_DEBUG"):  # подробный лог голосового соединения: docker run -e VOICE_DEBUG=1 ...
@@ -76,9 +75,6 @@ STALKER_QUOTES = [
 VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/)([\w-]{11})")
 SPOTIFY_RE = re.compile(r"open\.spotify\.com/(?:intl-[\w-]+/)?(track|album|playlist|artist)/")
 YANDEX_TRACK_RE = re.compile(r"music\.yandex\.\w+/(?:.*/)?track/(\d+)")
-VK_LINK_RE = re.compile(r"vk\.com|vk\.ru|^audio-?\d+_")
-VK_AUDIO_RE = re.compile(r"audio(-?\d+_\d+(?:_[0-9a-f]+)?)")
-VK_UA = "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"}
 
 
@@ -197,17 +193,6 @@ async def fetch(url: str, *, as_json: bool = False):
             return await r.json(content_type=None) if as_json else await r.text()
 
 
-async def vk_api(method: str, **params) -> dict:
-    timeout = aiohttp.ClientTimeout(total=10)
-    data = {**params, "access_token": VK_TOKEN, "v": "5.131"}
-    async with aiohttp.ClientSession(headers={"User-Agent": VK_UA}, timeout=timeout) as s:
-        async with s.post(f"https://api.vk.com/method/{method}", data=data) as r:
-            result = await r.json(content_type=None)
-    if "error" in result:
-        raise LookupError(f"ВК ответил: {result['error'].get('error_msg', 'ошибка')}")
-    return result.get("response")
-
-
 async def resolve_external(query: str) -> str | None:
     """Ссылку Spotify / Яндекс Музыки превращает в «Исполнитель - Трек» для поиска на YouTube."""
     if "open.spotify.com" in query:
@@ -225,18 +210,6 @@ async def resolve_external(query: str) -> str | None:
         if og:
             return html.unescape(og.group(1))
         raise LookupError("не смог прочитать трек со страницы Spotify")
-
-    if VK_LINK_RE.search(query):
-        if not VK_TOKEN:
-            raise LookupError("vk-no-token")
-        m = VK_AUDIO_RE.search(query)
-        if not m:
-            raise LookupError("из ВК пока понимаю только ссылки на отдельные треки (vk.com/audio…)")
-        items = await vk_api("audio.getById", audios=m.group(1)) or []
-        if not items:
-            raise LookupError("ВК не отдал этот трек — возможно, он удалён или закрыт")
-        t = items[0]
-        return f"{t.get('artist', '')} - {t.get('title', '')}".strip(" -")
 
     if "music.yandex." in query:
         m = YANDEX_TRACK_RE.search(query)
@@ -836,11 +809,8 @@ async def play(interaction: discord.Interaction, query: str):
                 await interaction.followup.send(f"➕ В очереди #{len(p.queue)}: {track.label()}{found}")
     except Exception as e:
         log.warning("/play %r: %s", query, e)
-        if VK_LINK_RE.search(query):
-            if str(e) == "vk-no-token":
-                msg = "❌ Музыку из ВК достать не могу — она доступна только с аккаунта. Напиши название трека, найду на YouTube."
-            else:
-                msg = f"❌ ВК: {e}"
+        if re.search(r"vk\.com|vk\.ru|^audio-?\d+_", query):
+            msg = "❌ Музыку из ВК достать не могу — она доступна только с аккаунта. Напиши название трека, найду на YouTube."
         elif "://" in query or re.match(r"^\S+\.[a-z]{2,}/\S*$", query):
             msg = ("❌ Не получилось открыть ссылку. Понимаю YouTube, SoundCloud, а также треки из Spotify и Яндекс Музыки. "
                    "Можно просто написать название.")
