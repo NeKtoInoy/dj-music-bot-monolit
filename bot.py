@@ -654,7 +654,11 @@ async def testtone(interaction: discord.Interaction):
         return await interaction.followup.send("❌ Сначала /stop.")
     src = discord.FFmpegPCMAudio("sine=frequency=440:duration=5", before_options="-f lavfi")
     vc.play(src, after=lambda e: log.info("testtone закончился, ошибка: %s", e))
-    log.info("testtone: opus=%s, играет=%s", discord.opus.is_loaded(), vc.is_playing())
+    c = vc._connection
+    ds = c.dave_session
+    log.info("testtone: opus=%s играет=%s | dave_ver=%s can_encrypt=%s ready=%s status=%s privacy_code=%s",
+             discord.opus.is_loaded(), vc.is_playing(), c.dave_protocol_version, c.can_encrypt,
+             getattr(ds, "ready", None), getattr(ds, "status", None), vc.voice_privacy_code)
     await interaction.followup.send("🔊 Пищу 5 секунд. Слышно?")
 
 
