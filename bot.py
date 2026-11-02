@@ -1,11 +1,13 @@
-﻿import asyncio
+import asyncio
 import html
+import json
 import logging
 import os
 import random
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 from collections import deque
@@ -37,6 +39,7 @@ MAX_PLAYLIST = 100              # сколько треков максимум �
 HISTORY_SIZE = 25               # сколько сыгранных треков помнить для ⏮️ и /history
 AUTOPLAY_BATCH = 3              # сколько похожих треков добавлять автоплеем за раз
 YTDLP_UPDATE_EVERY = 24 * 3600  # сек: как часто проверять обновления yt-dlp (только в Docker)
+INFO_TTL = 30 * 60               # сек: сколько живёт сохранённая инфа о треке (ссылки YouTube протухают)
 PANEL_COLOR = 0x1D9E75
 
 YTDL_OPTS = {
@@ -107,6 +110,16 @@ class Track:
     duration: int | None
     requester: str
     thumbnail: str | None = None
+    info_path: str | None = None   # сохранённый ответ yt-dlp, чтобы не искать трек второй раз
+    info_time: float = 0.0
+
+    def drop_info(self):
+        if self.info_path:
+            try:
+                os.remove(self.info_path)
+            except OSError:
+                pass
+            self.info_path = None
 
     @property
     def video_id(self) -> str | None:
@@ -127,13 +140,24 @@ def track_from_flat(e: dict, requester: str) -> Track:
     )
 
 
-def open_audio(url: str) -> tuple[subprocess.Popen, discord.FFmpegPCMAudio]:
+def save_info(data: dict) -> str:
+    """Сохраняет ответ yt-dlp во временный файл."""
+    fd, path = tempfile.mkstemp(prefix="ytinfo_", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(ytdl.sanitize_info(data), f)
+    return path
+
+
+def open_audio(track: "Track") -> tuple[subprocess.Popen, discord.FFmpegPCMAudio]:
     """yt-dlp качает звук кусками и отдаёт его ffmpeg через трубу.
-    Прямую ссылку ffmpeg YouTube теперь часто режет ошибкой 403."""
+    Прямую ссылку ffmpeg YouTube теперь часто режет ошибкой 403.
+    Если инфа о треке уже есть (её достали в /play) — отдаём её yt-dlp, чтобы он не искал трек заново."""
+    fresh = track.info_path and os.path.exists(track.info_path) and time.time() - track.info_time < INFO_TTL
+    source = ["--load-info-json", track.info_path] if fresh else [track.page_url]
     proc = subprocess.Popen(
         [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
          "--downloader", "native", "--http-chunk-size", "10M",
-         "-f", "bestaudio/best", "-o", "-", url],
+         "-f", "bestaudio/best", "-o", "-", *source],
         stdout=subprocess.PIPE,
     )
     audio = discord.FFmpegPCMAudio(proc.stdout, pipe=True, before_options="-nostdin", options="-vn")
@@ -330,6 +354,8 @@ class GuildPlayer:
         return True
 
     def stop(self):
+        for t in self.queue:
+            t.drop_info()
         self.queue.clear()
         self.last_played = None  # чтобы автоплей не включился сам после стопа
         self.drop_prefetch()
@@ -392,7 +418,7 @@ class GuildPlayer:
                     if not (self.prefetched and self.prefetched.track is nxt):
                         self.drop_prefetch()
                         try:
-                            proc, audio = open_audio(nxt.page_url)
+                            proc, audio = open_audio(nxt)
                             self.prefetched = Prepared(nxt, proc, audio)
                             log.info("Заранее гружу: %s", nxt.title)
                         except Exception as e:
@@ -443,7 +469,7 @@ class GuildPlayer:
                 proc, audio = prep.proc, prep.audio
             else:
                 try:
-                    proc, audio = open_audio(track.page_url)
+                    proc, audio = open_audio(track)
                 except Exception as e:
                     log.warning("Не загрузился %s: %s", track.title, e)
                     await self.send(f"❌ Не смог загрузить {track.label()}: {e}")
@@ -472,6 +498,7 @@ class GuildPlayer:
             if rc is None:
                 proc.kill()
             await asyncio.get_running_loop().run_in_executor(None, proc.wait)
+            track.drop_info()  # инфа одноразовая: при повторе трека yt-dlp возьмёт свежую
 
             # yt-dlp упал, а трек никто не пропускал — значит YouTube не отдал звук
             if rc not in (None, 0) and not (self.skip_requested or self.stop_requested or self.back_requested):
@@ -801,6 +828,10 @@ async def play(interaction: discord.Interaction, query: str):
                 requester=requester,
                 thumbnail=data.get("thumbnail"),
             )
+            try:
+                track.info_path, track.info_time = save_info(data), time.time()
+            except Exception as e:
+                log.warning("Не смог сохранить инфу о треке: %s", e)
             p.queue.append(track)
             found = f" (нашёл по «{external}»)" if external else ""
             if p.current is None:
