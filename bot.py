@@ -193,6 +193,25 @@ def open_audio(track: "Track", start: float = 0.0, af: str = "") -> tuple[subpro
     return proc, audio
 
 
+class PrimedSource(discord.AudioSource):
+    """Обёртка: сначала отдаёт заранее прочитанный кадр, потом читает дальше как обычно."""
+
+    def __init__(self, inner: discord.AudioSource, first: bytes):
+        self.inner, self.first = inner, first
+
+    def read(self) -> bytes:
+        if self.first is not None:
+            frame, self.first = self.first, None
+            return frame
+        return self.inner.read()
+
+    def is_opus(self) -> bool:
+        return self.inner.is_opus()
+
+    def cleanup(self):
+        self.inner.cleanup()
+
+
 @dataclass
 class Prepared:
     """Трек, который уже начали грузить заранее."""
@@ -318,10 +337,10 @@ class GuildPlayer:
         self.skip_requested = False
         self.stop_requested = False
         self.back_requested = False
-        self.restart_requested = False   # перезапуск текущего трека с позиции (перемотка, эффект, громкость)
-        self.restart_pos = 0.0
         self.effect = "none"
         self.seg_offset = 0.0            # с какой секунды трека начался текущий отрезок
+        self.cur_proc: subprocess.Popen | None = None  # yt-dlp, который сейчас качает звук
+        self.swap_gen = 0                # номер последней подмены потока (старые подмены отменяются)
         self.started_at = 0.0
         self.paused_at: float | None = None
         self.paused_total = 0.0
@@ -350,14 +369,42 @@ class GuildPlayer:
         return max(0.0, self.seg_offset + (end - self.started_at - self.paused_total) * self.speed)
 
     def restart_at(self, pos: float | None = None) -> bool:
-        """Перезапускает текущий трек с позиции — так работают перемотка, эффекты и громкость."""
+        """Перемотка, эффекты, громкость: готовит новый поток в фоне и подменяет им текущий без паузы."""
         if not self.current or not self.vc or not (self.vc.is_playing() or self.vc.is_paused()):
             return False
-        self.restart_pos = self.elapsed() if pos is None else max(0.0, pos)
-        self.restart_requested = True
+        pos = self.elapsed() if pos is None else max(0.0, pos)
         self.drop_prefetch()  # заготовка следующего трека сделана со старыми настройками
-        self.vc.stop()
+        self.swap_gen += 1
+        asyncio.create_task(self._swap(self.current, pos, self.swap_gen))
         return True
+
+    async def _swap(self, track: Track, pos: float, gen: int):
+        try:
+            proc, audio = open_audio(track, pos, self.audio_filter())
+        except Exception as e:
+            log.warning("Не смог подготовить новый поток: %s", e)
+            return
+        # ждём первый кадр нового потока — всё это время продолжает играть старый
+        first = await asyncio.get_running_loop().run_in_executor(None, audio.read)
+        vc = self.vc
+        if (gen != self.swap_gen or self.current is not track or not first
+                or not vc or not (vc.is_playing() or vc.is_paused())):
+            audio.cleanup()  # трек сменился или пришла более свежая подмена — эта уже не нужна
+            if proc.poll() is None:
+                proc.kill()
+            return
+        old_source, old_proc = vc.source, self.cur_proc
+        vc.source = PrimedSource(audio, first)
+        self.cur_proc = proc
+        self.seg_offset = pos
+        self.started_at = time.monotonic()
+        self.paused_total = 0.0
+        self.paused_at = time.monotonic() if vc.is_paused() else None
+        if old_proc and old_proc.poll() is None:
+            old_proc.kill()
+        if old_source:  # гасим старый ffmpeg в фоне, чтобы не подвешивать бота
+            asyncio.get_running_loop().run_in_executor(None, old_source.cleanup)
+        await self.refresh_panel()
 
     def snapshot(self) -> dict | None:
         """Состояние для сохранения на диск."""
@@ -547,21 +594,20 @@ class GuildPlayer:
 
             track = self.queue.popleft()
             self.current = track
-            start, first, failed = track.start_at, True, False
+            start, failed = track.start_at, False
             track.start_at = 0.0
-            while True:  # один трек может играть несколькими «отрезками» (перемотка, эффект, громкость)
-                prep = self.take_prefetched(track) if start == 0 else None
-                if prep:
-                    proc, audio = prep.proc, prep.audio
-                else:
-                    try:
-                        proc, audio = open_audio(track, start, self.audio_filter())
-                    except Exception as e:
-                        log.warning("Не загрузился %s: %s", track.title, e)
-                        await self.send(f"❌ Не смог загрузить {track.label()}: {e}")
-                        failed = True
-                        break
+            prep = self.take_prefetched(track) if start == 0 else None
+            if prep:
+                proc, audio = prep.proc, prep.audio
+            else:
+                try:
+                    proc, audio = open_audio(track, start, self.audio_filter())
+                except Exception as e:
+                    log.warning("Не загрузился %s: %s", track.title, e)
+                    await self.send(f"❌ Не смог загрузить {track.label()}: {e}")
+                    failed = True
 
+            if not failed:
                 done = asyncio.Event()
 
                 def after(err):
@@ -569,29 +615,26 @@ class GuildPlayer:
                         log.error("Ошибка воспроизведения: %s", err)
                     self.bot.loop.call_soon_threadsafe(done.set)
 
-                self.skip_requested = self.back_requested = self.restart_requested = False
+                self.skip_requested = self.back_requested = False
                 self.seg_offset = start
                 self.started_at = time.monotonic()
                 self.paused_at = None
                 self.paused_total = 0.0
+                self.cur_proc = proc
                 vc.play(audio, after=after)
-                if first:
-                    first = False
-                    await self.bot.set_listening(track.title)
-                    await self.show_panel()
-                    asyncio.create_task(self._prefetch_near_end(track))
-                else:
-                    await self.refresh_panel()
+                await self.bot.set_listening(track.title)
+                await self.show_panel()
+                asyncio.create_task(self._prefetch_near_end(track))
                 await done.wait()
 
+                # трек мог несколько раз подменяться (громкость/эффект/перемотка) — смотрим последний yt-dlp
+                proc = self.cur_proc or proc
                 rc = proc.poll()  # код выхода yt-dlp (None — ещё работает, например при пропуске)
                 if rc is None:
                     proc.kill()
                 await asyncio.get_running_loop().run_in_executor(None, proc.wait)
-                if self.restart_requested and self.vc and self.vc.is_connected():
-                    start = self.restart_pos
-                    continue
-                break
+                self.cur_proc = None
+                self.swap_gen += 1  # отменить подмены, которые не успели к концу трека
             track.drop_info()  # инфа одноразовая: при повторе трека yt-dlp возьмёт свежую
             if failed:
                 continue
