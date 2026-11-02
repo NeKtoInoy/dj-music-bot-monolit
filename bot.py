@@ -425,7 +425,11 @@ class DJBot(commands.Bot):
     async def on_ready(self):
         if shutil.which("ffmpeg") is None:
             log.warning("ffmpeg не найден! Музыка работать не будет.")
+        if not discord.opus.is_loaded():
+            discord.opus._load_default()
         log.info("opus загружен: %s", discord.opus.is_loaded())
+        if not discord.opus.is_loaded():
+            log.warning("Нет libopus! Звук работать не будет (apt install libopus0).")
         log.info("Бот %s запущен и готов к музыке!", self.user)
 
     async def on_voice_state_update(self, member, before, after):
