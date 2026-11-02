@@ -52,9 +52,43 @@ EFFECTS = {
     "bassboost": ("bass=g=10:f=110:w=0.6", 1.0),
     "nightcore": ("asetrate=60000,aresample=48000", 1.25),
     "slowed": ("asetrate=38400,aresample=48000", 0.8),
+    "vaporwave": ("asetrate=40800,aresample=48000,aecho=0.8:0.85:40:0.25", 0.85),
     "8d": ("apulsator=hz=0.08", 1.0),
+    "reverb": ("aecho=0.8:0.85:60|120:0.35|0.25", 1.0),
+    "echo": ("aecho=0.8:0.9:500|900:0.4|0.3", 1.0),
+    "radio": ("highpass=f=400,lowpass=f=3000,acrusher=bits=10:mix=0.25,volume=1.6", 1.0),
+    "muffled": ("lowpass=f=450,volume=1.3", 1.0),
+    "chipmunk": ("asetrate=62400,aresample=48000,atempo=0.769", 1.0),
+    "deep": ("asetrate=36000,aresample=48000,atempo=1.333", 1.0),
+    "karaoke": ("pan=stereo|c0=c0-c1|c1=c1-c0", 1.0),
+    "vibrato": ("vibrato=f=6:d=0.4", 1.0),
+    "emission": ("flanger=delay=8:depth=6:speed=0.3,aphaser=speed=0.4,bass=g=6", 1.0),
+    "radiation": ("acrusher=bits=6:mix=0.5:mode=log,volume=0.9", 1.0),
 }
-EFFECT_LABEL = {"none": "нет", "bassboost": "bass boost", "nightcore": "nightcore", "slowed": "slowed", "8d": "8D"}
+EFFECT_LABEL = {
+    "none": "нет", "bassboost": "bass boost", "nightcore": "nightcore", "slowed": "slowed",
+    "vaporwave": "vaporwave", "8d": "8D", "reverb": "концертный зал", "echo": "эхо подземки",
+    "radio": "рация сталкера", "muffled": "за стенкой", "chipmunk": "бурундук", "deep": "контролёр",
+    "karaoke": "караоке", "vibrato": "вибрато", "emission": "☢ выброс", "radiation": "☢ радиация",
+}
+EFFECT_DESC = {
+    "none": "Обычный звук",
+    "bassboost": "Больше баса",
+    "nightcore": "Быстрее и выше",
+    "slowed": "Медленнее и ниже",
+    "vaporwave": "Медленно, с эхом, как из 90-х",
+    "8d": "Звук гуляет вокруг головы (в наушниках)",
+    "reverb": "Как будто играет в большом зале",
+    "echo": "Далёкое эхо, как в тоннеле",
+    "radio": "Хрипящая рация",
+    "muffled": "Музыка у соседей за стеной",
+    "chipmunk": "Высокий голос, темп тот же",
+    "deep": "Низкий жуткий голос, темп тот же",
+    "karaoke": "Пытается убрать вокал (работает не на всех треках)",
+    "vibrato": "Дрожащий звук",
+    "emission": "Звук плывёт, как перед выбросом",
+    "radiation": "Звук фонит и крошится",
+}
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -1007,7 +1041,8 @@ class EffectSelect(discord.ui.Select):
         current = player.effect if player else "none"
         super().__init__(
             custom_id="dj:effect", row=3, placeholder="Эффект",
-            options=[discord.SelectOption(label=f"Эффект: {label}", value=key, default=key == current)
+            options=[discord.SelectOption(label=f"Эффект: {label}", value=key, default=key == current,
+                                          description=EFFECT_DESC.get(key))
                      for key, label in EFFECT_LABEL.items()],
         )
 
@@ -1507,7 +1542,7 @@ async def seek(interaction: discord.Interaction, position: str):
     await say(interaction, f"⏩ Перематываю на `{fmt_time(pos)}`…")
 
 
-@bot.tree.command(name="effect", description="Эффект звука: bass boost, nightcore, slowed, 8D")
+@bot.tree.command(name="effect", description="Эффект звука: bass boost, nightcore, vaporwave, рация, выброс и другие")
 @app_commands.describe(name="Какой эффект")
 @app_commands.choices(name=[app_commands.Choice(name=v, value=k) for k, v in EFFECT_LABEL.items()])
 @app_commands.guild_only()
